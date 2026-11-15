@@ -1,0 +1,48 @@
+--- a/esphome/components/runtime_image/image_decoder.cpp
++++ b/esphome/components/runtime_image/image_decoder.cpp
+@@ -13,17 +13,40 @@
+   this->size_valid_ = success;
+   this->x_scale_ = static_cast<double>(this->image_->get_buffer_width()) / width;
+   this->y_scale_ = static_cast<double>(this->image_->get_buffer_height()) / height;
++  this->unscaled_ = (this->x_scale_ == 1.0 && this->y_scale_ == 1.0);
+   return success;
+ }
+ 
+-void ImageDecoder::draw(int x, int y, int w, int h, const Color &color) {
++void HOT ImageDecoder::draw(int x, int y, int w, int h, const Color &color) {
+   if (!this->size_valid_) {
+     return;
+   }
+-  auto width = std::min(this->image_->get_buffer_width(), static_cast<int>(std::ceil((x + w) * this->x_scale_)));
+-  auto height = std::min(this->image_->get_buffer_height(), static_cast<int>(std::ceil((y + h) * this->y_scale_)));
+-  for (int i = x * this->x_scale_; i < width; i++) {
+-    for (int j = y * this->y_scale_; j < height; j++) {
++  const int buf_w = this->image_->get_buffer_width();
++  const int buf_h = this->image_->get_buffer_height();
++  int i_start, j_start, i_end, j_end;
++
++  if (this->unscaled_) {
++    // Buffer is the same size as the source image, so every scale factor is
++    // exactly 1.0 and no floating point is needed at all. This is the
++    // overwhelmingly common case - `resize:` matching the native size, or no
++    // resize at all - and for a non-interlaced PNG this runs once per pixel
++    // with w == h == 1, so the general branch would spend four soft-float
++    // double multiplies and two std::ceil calls per pixel to multiply by one.
++    i_start = x;
++    j_start = y;
++    i_end = std::min(buf_w, x + w);
++    j_end = std::min(buf_h, y + h);
++  } else {
++    i_start = static_cast<int>(x * this->x_scale_);
++    j_start = static_cast<int>(y * this->y_scale_);
++    i_end = std::min(buf_w, static_cast<int>(std::ceil((x + w) * this->x_scale_)));
++    j_end = std::min(buf_h, static_cast<int>(std::ceil((y + h) * this->y_scale_)));
++  }
++
++  // Row-major: the buffer is row-major, so walking y outermost keeps writes
++  // sequential instead of striding a whole row per step.
++  for (int j = j_start; j < j_end; j++) {
++    for (int i = i_start; i < i_end; i++) {
+       this->image_->draw_pixel(i, j, color);
+     }
+   }

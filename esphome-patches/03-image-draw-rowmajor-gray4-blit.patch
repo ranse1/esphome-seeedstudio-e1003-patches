@@ -1,0 +1,140 @@
+--- a/esphome/components/image/image.cpp
++++ b/esphome/components/image/image.cpp
+@@ -23,10 +23,16 @@
+       h = clipping.y2() - y;
+   }
+ 
++  // NOTE: every loop below is deliberately row-major (img_y outer, img_x
++  // inner). The pixel data is stored row-major, so iterating y innermost - as
++  // this code originally did - strides a full row between consecutive reads
++  // and misses the cache on every pixel. For a full-screen image in PSRAM that
++  // is the dominant cost of a repaint. The set of pixels drawn is identical;
++  // only the order changed.
+   switch (type_) {
+     case IMAGE_TYPE_BINARY: {
+-      for (int img_x = img_x0; img_x < w; img_x++) {
+-        for (int img_y = img_y0; img_y < h; img_y++) {
++      for (int img_y = img_y0; img_y < h; img_y++) {
++        for (int img_x = img_x0; img_x < w; img_x++) {
+           if (this->get_binary_pixel_(img_x, img_y)) {
+             display->draw_pixel_at(x + img_x, y + img_y, color_on);
+           } else if (!this->transparency_) {
+@@ -37,8 +43,8 @@
+       break;
+     }
+     case IMAGE_TYPE_GRAYSCALE:
+-      for (int img_x = img_x0; img_x < w; img_x++) {
+-        for (int img_y = img_y0; img_y < h; img_y++) {
++      for (int img_y = img_y0; img_y < h; img_y++) {
++        for (int img_x = img_x0; img_x < w; img_x++) {
+           const uint32_t pos = (img_x + img_y * this->width_);
+           const uint8_t gray = progmem_read_byte(this->data_start_ + pos);
+           Color color = Color(gray, gray, gray, 0xFF);
+@@ -63,9 +69,50 @@
+         }
+       }
+       break;
++    case IMAGE_TYPE_GRAYSCALE_4BIT: {
++      // Two pixels per byte, rows padded to a byte, so the stride is not width/2.
++      const size_t stride = this->get_width_stride();
++      // If the display's own framebuffer is 4bpp greyscale it can take these
++      // rows verbatim, which skips unpacking every nibble to 8 bits, wrapping
++      // it in a Color and quantising it straight back again. Only offered for
++      // an unclipped, fully opaque, whole-image draw; the display refuses
++      // anything it cannot honour and we fall through to the pixel loop.
++      if (this->transparency_ == TRANSPARENCY_OPAQUE && img_x0 == 0 && img_y0 == 0 && w == this->width_ &&
++          h == this->height_ &&
++          display->draw_gray4_packed(x, y, this->width_, this->height_, this->data_start_, stride)) {
++        break;
++      }
++      for (int img_y = img_y0; img_y < h; img_y++) {
++        const uint8_t *row = this->data_start_ + static_cast<size_t>(img_y) * stride;
++        for (int img_x = img_x0; img_x < w; img_x++) {
++          const uint8_t packed = progmem_read_byte(row + (img_x >> 1));
++          const uint8_t nibble = (img_x & 1) ? (packed & 0x0F) : (packed >> 4);
++          const uint8_t gray = gray4_to_gray8(nibble);
++          Color color = Color(gray, gray, gray, 0xFF);
++          switch (this->transparency_) {
++            case TRANSPARENCY_CHROMA_KEY:
++              if (nibble == 1) {
++                continue;  // skip drawing
++              }
++              break;
++            case TRANSPARENCY_ALPHA_CHANNEL: {
++              auto on = (float) gray / 255.0f;
++              auto off = 1.0f - on;
++              color = Color(color_on.r * on + color_off.r * off, color_on.g * on + color_off.g * off,
++                            color_on.b * on + color_off.b * off, 0xFF);
++              break;
++            }
++            default:
++              break;
++          }
++          display->draw_pixel_at(x + img_x, y + img_y, color);
++        }
++      }
++      break;
++    }
+     case IMAGE_TYPE_RGB565:
+-      for (int img_x = img_x0; img_x < w; img_x++) {
+-        for (int img_y = img_y0; img_y < h; img_y++) {
++      for (int img_y = img_y0; img_y < h; img_y++) {
++        for (int img_x = img_x0; img_x < w; img_x++) {
+           auto color = this->get_rgb565_pixel_(img_x, img_y);
+           if (color.w >= 0x80) {
+             display->draw_pixel_at(x + img_x, y + img_y, color);
+@@ -74,8 +121,8 @@
+       }
+       break;
+     case IMAGE_TYPE_RGB:
+-      for (int img_x = img_x0; img_x < w; img_x++) {
+-        for (int img_y = img_y0; img_y < h; img_y++) {
++      for (int img_y = img_y0; img_y < h; img_y++) {
++        for (int img_x = img_x0; img_x < w; img_x++) {
+           auto color = this->get_rgb_pixel_(img_x, img_y);
+           if (color.w >= 0x80) {
+             display->draw_pixel_at(x + img_x, y + img_y, color);
+@@ -95,6 +142,8 @@
+       return color_off;
+     case IMAGE_TYPE_GRAYSCALE:
+       return this->get_grayscale_pixel_(x, y);
++    case IMAGE_TYPE_GRAYSCALE_4BIT:
++      return this->get_grayscale_4bit_pixel_(x, y);
+     case IMAGE_TYPE_RGB565:
+       return this->get_rgb565_pixel_(x, y);
+     case IMAGE_TYPE_RGB:
+@@ -209,6 +258,24 @@
+       return Color(gray, gray, gray, 0xFF);
+   }
+ }
++Color Image::get_grayscale_4bit_pixel_(int x, int y) const {
++  // Two pixels per byte, high nibble first, rows padded to a byte boundary.
++  const uint8_t packed = progmem_read_byte(this->data_start_ + y * this->get_width_stride() + (x >> 1));
++  const uint8_t nibble = (x & 1) ? (packed & 0x0F) : (packed >> 4);
++  const uint8_t gray = gray4_to_gray8(nibble);
++  switch (this->transparency_) {
++    case TRANSPARENCY_CHROMA_KEY:
++      // Mirrors the 8-bit case: one level is reserved as the key. There it is
++      // value 1; here it is level 1.
++      if (nibble == 1)
++        return Color(0, 0, 0, 0);
++      return Color(gray, gray, gray, 0xFF);
++    case TRANSPARENCY_ALPHA_CHANNEL:
++      return Color(0, 0, 0, gray);
++    default:
++      return Color(gray, gray, gray, 0xFF);
++  }
++}
+ int Image::get_width() const { return this->width_; }
+ int Image::get_height() const { return this->height_; }
+ ImageType Image::get_type() const { return this->type_; }
+@@ -221,6 +288,9 @@
+     case IMAGE_TYPE_GRAYSCALE:
+       this->bpp_ = 8;
+       break;
++    case IMAGE_TYPE_GRAYSCALE_4BIT:
++      this->bpp_ = 4;
++      break;
+     case IMAGE_TYPE_RGB565:
+       this->bpp_ = 16;
+       break;

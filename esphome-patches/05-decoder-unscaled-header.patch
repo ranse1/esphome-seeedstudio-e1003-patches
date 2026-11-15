@@ -1,0 +1,22 @@
+--- a/esphome/components/runtime_image/image_decoder.h
++++ b/esphome/components/runtime_image/image_decoder.h
+@@ -60,6 +60,7 @@
+     this->size_valid_ = true;
+     this->x_scale_ = 1.0;
+     this->y_scale_ = 1.0;
++    this->unscaled_ = true;
+   }
+ 
+   /**
+@@ -134,6 +135,11 @@
+   size_t decoded_bytes_ = 0;  // Bytes processed so far
+   const ImageFormat format_;
+   bool active_ = false;     // A decoding session is in progress
++  // True when the decoded image is the same size as the buffer, i.e. both
++  // scales are exactly 1.0. Cached in set_size() so draw() can take an
++  // integer-only path: on Xtensa (no hardware double) the scaling maths in
++  // draw() is soft-float and runs once per pixel, which dominates decode time.
++  bool unscaled_ = true;
+   bool size_valid_ = true;  // Last set_size() result; draw() no-ops while false
+ };
+ 

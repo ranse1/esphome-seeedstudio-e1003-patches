@@ -1,0 +1,32 @@
+--- a/esphome/components/display/display.h
++++ b/esphome/components/display/display.h
+@@ -365,6 +365,29 @@
+     this->draw_pixels_at(x_start, y_start, w, h, ptr, order, bitness, big_endian, 0, 0, 0);
+   }
+ 
++  /** Blit a 4-bits-per-pixel packed greyscale source straight into the display's
++   * own framebuffer, bypassing the per-pixel path entirely.
++   *
++   * Only worth implementing on displays whose native framebuffer is itself 4bpp
++   * greyscale with the same nibble order (two pixels per byte, high nibble
++   * first, rows padded to a byte) - then a row is a memcpy, or a byte-reversal
++   * when the display mirrors horizontally. On such a display the generic path
++   * unpacks each nibble to 8 bits, builds a Color, and quantises it straight
++   * back to the same nibble, several million times per full-screen draw.
++   *
++   * An implementation must honour the display's own clipping rectangle and
++   * transform, or return false and let the caller use the per-pixel path.
++   *
++   * @param src        Packed 4bpp source, high nibble first.
++   * @param src_stride Bytes per source row, including any padding.
++   * @return true if the blit was performed; false if the caller must fall back
++   *         to the per-pixel path. The default implementation always returns
++   *         false, so displays that do not implement it are unaffected.
++   */
++  virtual bool draw_gray4_packed(int x_start, int y_start, int w, int h, const uint8_t *src, size_t src_stride) {
++    return false;
++  }
++
+   /// Draw a straight line from the point [x1,y1] to [x2,y2] with the given color.
+   void line(int x1, int y1, int x2, int y2, Color color = COLOR_ON);
+ 

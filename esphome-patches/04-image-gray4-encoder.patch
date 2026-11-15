@@ -1,0 +1,68 @@
+--- a/esphome/components/image/__init__.py
++++ b/esphome/components/image/__init__.py
+@@ -207,6 +207,57 @@
+         self.index += 1
+ 
+ 
++class ImageGrayscale4Bit(ImageGrayscale):
++    """4 bits per pixel greyscale: two pixels per byte, high nibble first.
++
++    Half the size of ImageGrayscale, which matters for full-screen buffers in
++    PSRAM, and the native format of 16-level e-paper controllers. Inherits
++    convert() and allow_config from the 8-bit encoder unchanged.
++
++    Packing follows ImageBinary rather than ImageGrayscale: the row width is
++    given to the base class in BYTES, and end_row() pads a partial trailing
++    byte so every row starts on a byte boundary - matching the stride the C++
++    side derives from Image::get_width_stride().
++    """
++
++    def __init__(self, width, height, transparency, dither, invert_alpha):
++        super().__init__((width + 1) // 2, height, transparency, dither, invert_alpha)
++        self.high_nibble = True
++
++    def encode(self, pixel):
++        b, a = pixel
++        if self.invert_alpha:
++            b ^= 0xFF
++        if self.transparency == CONF_ALPHA_CHANNEL and a != 0xFF:
++            b = a
++        # A rounding divide by 17, the exact inverse of the n * 17 expansion the
++        # C++ side uses when reading a pixel back (image.h: gray8_to_gray4).
++        # Integer maths so it matches the device arithmetic exactly; 4096 / 17 =
++        # 240.94, and the largest input 255 lands on 15 with no clamp needed.
++        nibble = (b * 241 + 2048) >> 12
++        if self.transparency == CONF_CHROMA_KEY:
++            # Level 1 is the reserved key, as value 1 is for the 8-bit encoder.
++            # Applied AFTER quantising: testing b == 17 in 8-bit space caught
++            # only one of the 17 values that round onto level 1 (b in 9..25),
++            # so the rest would have come out transparent on the device.
++            if nibble == 1:
++                nibble = 0
++            if a != 0xFF:
++                nibble = 1
++        if self.high_nibble:
++            self.data[self.index] = nibble << 4
++        else:
++            self.data[self.index] |= nibble
++            self.index += 1
++        self.high_nibble = not self.high_nibble
++
++    def end_row(self):
++        """Pad rows to a byte boundary."""
++        if not self.high_nibble:
++            self.high_nibble = True
++            self.index += 1
++
++
+ class ImageRGB565(ImageEncoder):
+     def __init__(self, width, height, transparency, dither, invert_alpha):
+         super().__init__(
+@@ -315,6 +366,7 @@
+ IMAGE_TYPE = {
+     "BINARY": ImageBinary,
+     "GRAYSCALE": ImageGrayscale,
++    "GRAYSCALE_4BIT": ImageGrayscale4Bit,
+     "RGB565": ImageRGB565,
+     "RGB": ImageRGB,
+     "TRANSPARENT_BINARY": ReplaceWith("'type: BINARY' and 'transparency: chroma_key'"),

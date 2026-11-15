@@ -1,0 +1,26 @@
+--- a/esphome/components/it8951/it8951.h
++++ b/esphome/components/it8951/it8951.h
+@@ -202,6 +202,7 @@
+   // draw_pixel_at overhead (watchdog feed, clipping test, dirty-box clamps).
+   void draw_pixels_at(int x_start, int y_start, int w, int h, const uint8_t *ptr, ColorOrder order,
+                       ColorBitness bitness, bool big_endian, int x_offset, int y_offset, int x_pad) override;
++  bool draw_gray4_packed(int x_start, int y_start, int w, int h, const uint8_t *src, size_t src_stride) override;
+   int get_width() override { return (this->effective_transform_ & TRANSFORM_SWAP_XY) ? this->height_ : this->width_; }
+   int get_height() override { return (this->effective_transform_ & TRANSFORM_SWAP_XY) ? this->width_ : this->height_; }
+ 
+@@ -290,6 +291,15 @@
+   UpdateMode active_mode_{UPDATE_MODE_NONE};
+   uint16_t area_x_{0}, area_y_{0}, area_w_{0}, area_h_{0};
+   uint16_t transfer_row_{0};
++  // Instrumentation for the "Update took" line: microseconds spent inside
++  // op_xfer_rows_ and how many loop slices the transfer was split into.
++  uint32_t xfer_busy_us_{0};
++  uint32_t xfer_gap_us_{0};       // main-loop time between consecutive slices
++  uint32_t xfer_last_end_us_{0};
++  uint16_t xfer_slices_{0};
++  static constexpr unsigned PHASE_MS_SLOTS = 16;
++  uint32_t phase_ms_[PHASE_MS_SLOTS]{};  // wall ms per Phase during the last update
++  void reset_update_stats_();
+   bool initialised_{false};
+   // True once TCON_SLEEP has been sent and the controller has not been woken
+   // since. The next update must issue TCON_SYS_RUN before any SPI op.
