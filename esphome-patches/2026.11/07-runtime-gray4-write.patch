@@ -1,0 +1,26 @@
+--- a/esphome/components/runtime_image/runtime_image.cpp
++++ b/esphome/components/runtime_image/runtime_image.cpp
+@@ -139,6 +139,23 @@
+       this->buffer_[pos] = gray;
+       break;
+     }
++    case image::IMAGE_TYPE_GRAYSCALE_4BIT: {
++      // Not get_position_(): (x + y*w) * bpp / 8 ignores each row's padding to a byte, wrong for odd widths.
++      const size_t stride = (static_cast<size_t>(this->buffer_width_) + 1u) / 2u;
++      uint8_t nibble = image::color_to_gray4(color);
++      if (this->transparency_ == image::TRANSPARENCY_CHROMA_KEY) {
++        // Level 1 is the key, as value 1 is in the 8-bit case
++        if (nibble == 1)
++          nibble = 0;
++        if (color.w < 0x80)
++          nibble = 1;
++      } else if (this->transparency_ == image::TRANSPARENCY_ALPHA_CHANNEL) {
++        if (color.w != 0xFF)
++          nibble = image::gray8_to_gray4(color.w);
++      }
++      image::set_gray4(this->buffer_ + static_cast<size_t>(y) * stride, x, nibble);
++      break;
++    }
+     case image::IMAGE_TYPE_RGB565: {
+       const size_t pos = (x + y * this->buffer_width_) * 2;
+       Color mapped_color = color;

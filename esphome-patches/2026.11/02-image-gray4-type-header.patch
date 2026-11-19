@@ -1,0 +1,49 @@
+--- a/esphome/components/image/image.h
++++ b/esphome/components/image/image.h
+@@ -14,8 +14,38 @@
+   IMAGE_TYPE_RGB = 2,
+   IMAGE_TYPE_RGB565 = 3,
+   IMAGE_TYPE_RGB111 = 4,  // one bit per channel plus an optional alpha bit, for colour e-paper
++  // 4 bits per pixel, two pixels per byte, high nibble first - the same packing
++  // and order as IMAGE_TYPE_BINARY uses for its bits. Rows are padded to a byte
++  // boundary, so get_width_stride() already returns the right value.
++  //
++  // Halves the buffer against IMAGE_TYPE_GRAYSCALE, which matters for
++  // full-screen online_image buffers in PSRAM, and is the native format of
++  // 16-level e-paper controllers such as the IT8951.
++  IMAGE_TYPE_GRAYSCALE_4BIT = 5,
+ };
+ 
++/// Expand a 4-bit grey level to 8-bit. The 16 levels are n * 255/15 = n * 17,
++/// so level 15 becomes a true 255 and every level survives a round trip.
++inline uint8_t gray4_to_gray8(uint8_t nibble) { return static_cast<uint8_t>(nibble * 17u); }
++
++/// The inverse: a rounding divide by 17 with no division instruction, since
++/// 4096 / 17 = 240.94. Exact for all 256 inputs and never exceeds 15, so
++/// callers need no clamp.
++inline uint8_t gray8_to_gray4(uint8_t gray) { return static_cast<uint8_t>((gray * 241u + 2048u) >> 12); }
++
++/// A colour's 4-bit grey level, from the same integer luma as RuntimeImage's 8-bit case. The one definition for
++/// every 4bpp decode path, which must agree byte for byte; it runs per decoded pixel, so no float here.
++inline uint8_t color_to_gray4(const Color &color) {
++  return gray8_to_gray4(static_cast<uint8_t>((54 * color.r + 183 * color.g + 19 * color.b) >> 8));
++}
++
++/// Store a 4-bit level as pixel x of a packed row, high nibble first as BINARY is MSB first. Read-modify-write: the
++/// byte is shared with the neighbouring pixel.
++inline void set_gray4(uint8_t *row, int x, uint8_t nibble) {
++  uint8_t &byte = row[x >> 1];
++  byte = (x & 1) ? static_cast<uint8_t>((byte & 0xF0u) | nibble) : static_cast<uint8_t>((byte & 0x0Fu) | (nibble << 4));
++}
++
+ enum Transparency {
+   TRANSPARENCY_OPAQUE = 0,
+   TRANSPARENCY_CHROMA_KEY = 1,
+@@ -60,6 +90,7 @@
+   Color get_rgb_pixel_(int x, int y) const;
+   Color get_rgb565_pixel_(int x, int y) const;
+   Color get_grayscale_pixel_(int x, int y) const;
++  Color get_grayscale_4bit_pixel_(int x, int y) const;
+ 
+   int width_;
+   int height_;

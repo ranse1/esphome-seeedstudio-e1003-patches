@@ -1,0 +1,63 @@
+--- a/esphome/components/image/__init__.py
++++ b/esphome/components/image/__init__.py
+@@ -139,6 +139,10 @@
+     """
+     Check if an image (assumed to be RGBA) is only alpha
+     """
++    # Without this a single-band image (L, 1, P) has no colour bands, all([])
++    # is True, and an opaque grey PNG is built as alpha-only.
++    if "A" not in image.getbands():
++        return False
+     # Any alpha data?
+     if image.split()[-1].getextrema()[0] == 0xFF:
+         return False
+@@ -260,6 +264,41 @@
+         self.index += 1
+ 
+ 
++class ImageGrayscale4Bit(BitPackedEncoder, ImageGrayscale):
++    """4 bits per pixel greyscale: two pixels per byte, high nibble first.
++
++    Half the size of ImageGrayscale, which matters for full-screen buffers in
++    PSRAM, and the native format of 16-level e-paper controllers. The packing
++    and row padding come from BitPackedEncoder, matching the stride the C++
++    side derives from Image::get_width_stride(); convert() and allow_config
++    come from the 8-bit encoder.
++    """
++
++    def __init__(self, width, height, transparency, dither, invert_alpha):
++        super().__init__(4, width, height, transparency, dither, invert_alpha)
++
++    def encode(self, pixel):
++        b, a = pixel
++        if self.invert_alpha:
++            b ^= 0xFF
++        if self.transparency == CONF_ALPHA_CHANNEL and a != 0xFF:
++            b = a
++        # Rounding divide by 17, the inverse of the n * 17 expansion on the C++
++        # side (image.h: gray8_to_gray4); 4096 / 17 = 240.94, 255 lands on 15.
++        nibble = (b * 241 + 2048) >> 12
++        if self.transparency == CONF_CHROMA_KEY:
++            # Level 1 is the key. Tested after quantising: b == 17 in 8-bit
++            # space would miss the other 16 values (9..25) that round onto it.
++            if nibble == 1:
++                nibble = 0
++            if a != 0xFF:
++                nibble = 1
++        self.data[self.index] |= nibble << (4 - self.bitno)
++        self.bitno += 4
++        if self.bitno == 8:
++            self.end_row()
++
++
+ class ImageRGB565(ImageEncoder):
+     def __init__(self, width, height, transparency, dither, invert_alpha):
+         super().__init__(
+@@ -368,6 +407,7 @@
+ IMAGE_TYPE = {
+     "BINARY": ImageBinary,
+     "GRAYSCALE": ImageGrayscale,
++    "GRAYSCALE_4BIT": ImageGrayscale4Bit,
+     "RGB111": ImageRGB111,
+     "RGB565": ImageRGB565,
+     "RGB": ImageRGB,

@@ -1,0 +1,10 @@
+--- a/esphome/components/it8951/it8951.h
++++ b/esphome/components/it8951/it8951.h
+@@ -200,6 +200,7 @@
+   int get_width() override { return (this->effective_transform_ & TRANSFORM_SWAP_XY) ? this->height_ : this->width_; }
+   int get_height() override { return (this->effective_transform_ & TRANSFORM_SWAP_XY) ? this->width_ : this->height_; }
+   bool pixel_axes_swapped() const override { return this->effective_transform_ & TRANSFORM_SWAP_XY; }
++  bool draw_gray4_packed(int x_start, int y_start, int w, int h, const uint8_t *src, size_t src_stride) override;
+ 
+  protected:
+   // Bulk pixel blit (used by LVGL and image rendering). Overridden to write

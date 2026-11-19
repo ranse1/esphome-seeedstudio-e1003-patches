@@ -1,0 +1,90 @@
+--- a/esphome/components/image/image.cpp
++++ b/esphome/components/image/image.cpp
+@@ -64,6 +64,14 @@
+                             x_start, y_start, this->width_ - x_end);
+     return;
+   }
++  // A display whose framebuffer is itself 4bpp greyscale takes the rows verbatim,
++  // skipping the unpack to 8 bits, the Color and the quantise straight back. Only
++  // for an unclipped, opaque, whole-image draw; it refuses anything else.
++  if (this->type_ == IMAGE_TYPE_GRAYSCALE_4BIT && this->transparency_ == TRANSPARENCY_OPAQUE && x_start == 0 &&
++      y_start == 0 && x_end == this->width_ && y_end == this->height_ &&
++      display->draw_gray4_packed(x, y, this->width_, this->height_, this->data_start_, this->get_width_stride())) {
++    return;
++  }
+ #endif
+ 
+   // Rows keep the read and the write sequential; when the display swaps the axes
+@@ -124,6 +132,31 @@
+                                  });
+       break;
+     }
++    case IMAGE_TYPE_GRAYSCALE_4BIT: {
++      // pos is a pixel index; rows are padded to a byte, so address by stride.
++      const uint8_t *const data = this->data_start_;
++      const size_t stride = this->get_width_stride();
++      for_each_pixel<ROWS_OUTER>(x_start, x_end, y_start, y_end, width,
++                                 [&](int img_x, int img_y, int pos) ESPHOME_ALWAYS_INLINE {
++                                   const uint8_t packed =
++                                       progmem_read_byte(data + static_cast<size_t>(img_y) * stride + (img_x >> 1));
++                                   const uint8_t nibble = (img_x & 1) ? (packed & 0x0F) : (packed >> 4);
++                                   const uint8_t gray = gray4_to_gray8(nibble);
++                                   Color color = Color(gray, gray, gray, 0xFF);
++                                   if (transparency == TRANSPARENCY_CHROMA_KEY) {
++                                     // Level 1 is the key, as value 1 is for 8-bit grayscale
++                                     if (nibble == 1) {
++                                       return;
++                                     }
++                                   } else if (transparency == TRANSPARENCY_ALPHA_CHANNEL) {
++                                     color = Color(Color::blend_channel(color_off.r, color_on.r, gray),
++                                                   Color::blend_channel(color_off.g, color_on.g, gray),
++                                                   Color::blend_channel(color_off.b, color_on.b, gray), 0xFF);
++                                   }
++                                   display->draw_pixel_at(x + img_x, y + img_y, color);
++                                 });
++      break;
++    }
+     case IMAGE_TYPE_RGB565:
+       for_each_pixel<ROWS_OUTER>(x_start, x_end, y_start, y_end, width,
+                                  [&](int img_x, int img_y, int pos) ESPHOME_ALWAYS_INLINE {
+@@ -156,6 +189,8 @@
+       return this->get_rgb111_pixel_(x, y);
+     case IMAGE_TYPE_GRAYSCALE:
+       return this->get_grayscale_pixel_(x, y);
++    case IMAGE_TYPE_GRAYSCALE_4BIT:
++      return this->get_grayscale_4bit_pixel_(x, y);
+     case IMAGE_TYPE_RGB565:
+       return this->get_rgb565_pixel_(x, y);
+     case IMAGE_TYPE_RGB:
+@@ -304,6 +339,21 @@
+       return Color(gray, gray, gray, 0xFF);
+   }
+ }
++Color Image::get_grayscale_4bit_pixel_(int x, int y) const {
++  const uint8_t packed = progmem_read_byte(this->data_start_ + y * this->get_width_stride() + (x >> 1));
++  const uint8_t nibble = (x & 1) ? (packed & 0x0F) : (packed >> 4);
++  const uint8_t gray = gray4_to_gray8(nibble);
++  switch (this->transparency_) {
++    case TRANSPARENCY_CHROMA_KEY:
++      if (nibble == 1)
++        return Color(0, 0, 0, 0);
++      return Color(gray, gray, gray, 0xFF);
++    case TRANSPARENCY_ALPHA_CHANNEL:
++      return Color(0, 0, 0, gray);
++    default:
++      return Color(gray, gray, gray, 0xFF);
++  }
++}
+ int Image::get_width() const { return this->width_; }
+ int Image::get_height() const { return this->height_; }
+ ImageType Image::get_type() const { return this->type_; }
+@@ -325,6 +375,9 @@
+     case IMAGE_TYPE_GRAYSCALE:
+       this->bpp_ = 8;
+       break;
++    case IMAGE_TYPE_GRAYSCALE_4BIT:
++      this->bpp_ = 4;
++      break;
+     case IMAGE_TYPE_RGB565:
+       this->bpp_ = 16;
+       break;

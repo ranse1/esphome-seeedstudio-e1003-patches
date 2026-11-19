@@ -1,0 +1,71 @@
+--- a/esphome/components/runtime_image/image_decoder.h
++++ b/esphome/components/runtime_image/image_decoder.h
+@@ -101,6 +101,7 @@
+     this->draw_width_ = 0;
+     this->draw_height_ = 0;
+     this->direct_rgb565_ = false;
++    this->direct_gray4_ = false;
+   }
+ 
+   /**
+@@ -208,6 +209,7 @@
+   void prepare_draw_(int width, int height);
+   /// Paint a block of source pixels in one color straight into the buffer. Only while uses_direct_rgb565().
+   void draw_rgb565_(int x, int y, int w, int h, uint16_t rgb565);
++  void draw_gray4_(int x, int y, int w, int h, const Color &color);
+ 
+   /// The image's pixel buffer, for decoders that write their output straight into it
+   uint8_t *image_buffer_() const;
+@@ -226,6 +228,7 @@
+   bool active_ = false;     // A decoding session is in progress
+   bool size_valid_ = true;  // Last set_size() result; draw() no-ops while false
+   bool direct_rgb565_ = false;
++  bool direct_gray4_ = false;
+ };
+ 
+ }  // namespace esphome::runtime_image
+--- a/esphome/components/runtime_image/image_decoder.cpp
++++ b/esphome/components/runtime_image/image_decoder.cpp
+@@ -23,6 +23,10 @@
+ void ImageDecoder::prepare_draw_(int width, int height) {
+   this->draw_width_ = width;
+   this->draw_height_ = height;
++  // Unscaled only: every caller of the 4bpp type decodes at the buffer's size, and the scaled case keeps draw_pixel().
++  this->direct_gray4_ = this->image_->get_type() == image::IMAGE_TYPE_GRAYSCALE_4BIT &&
++                        !this->image_->has_transparency() && width == this->image_->get_buffer_width() &&
++                        height == this->image_->get_buffer_height();
+   this->direct_rgb565_ = this->image_->get_type() == image::IMAGE_TYPE_RGB565 && !this->image_->has_transparency();
+   if (!this->direct_rgb565_)
+     return;
+@@ -75,10 +79,31 @@
+   }
+ }
+ 
++// The opaque case of RuntimeImage::draw_pixel() for GRAYSCALE_4BIT, minus its per-pixel call, checks and type switch:
++// it runs for every pixel of a full-screen PNG. color_to_gray4() and set_gray4() keep the two byte-identical.
++void ImageDecoder::draw_gray4_(int x, int y, int w, int h, const Color &color) {
++  const int x_end = std::min(x + w, this->draw_width_);
++  const int y_end = std::min(y + h, this->draw_height_);
++  x = std::max(x, 0);
++  y = std::max(y, 0);
++  const uint8_t nibble = image::color_to_gray4(color);
++  const size_t stride = (static_cast<size_t>(this->draw_width_) + 1u) / 2u;
++  uint8_t *const buffer = this->image_buffer_();
++  for (int row = y; row < y_end; row++) {
++    uint8_t *line = buffer + static_cast<size_t>(row) * stride;
++    for (int col = x; col < x_end; col++)
++      image::set_gray4(line, col, nibble);
++  }
++}
++
+ void ImageDecoder::draw(int x, int y, int w, int h, const Color &color) {
+   if (!this->size_valid_) {
+     return;
+   }
++  if (this->direct_gray4_) {
++    this->draw_gray4_(x, y, w, h, color);
++    return;
++  }
+   if (this->direct_rgb565_) {
+     this->draw_rgb565_(x, y, w, h, display::ColorUtil::color_to_565(color));
+     return;
