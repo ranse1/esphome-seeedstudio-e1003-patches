@@ -1,10 +1,135 @@
 --- a/esphome/components/it8951/it8951.h
 +++ b/esphome/components/it8951/it8951.h
-@@ -200,6 +200,7 @@
+@@ -101,10 +101,7 @@
+   CHECK_LUT_IDLE,   // checks read_result_; if non-zero, re-enqueues read sequence
+   SET_1BPP,         // uses read_result_ to set UP1SR bit 2, enqueues writes
+   XFER_LISAR,       // set image-buffer target address (2× reg write: 4 CS transactions)
+-  XFER_AREA_CMD,    // single CS: CMD preamble + TCON_LD_IMG_AREA
+-  XFER_AREA_ARGS,   // single CS: WRITE preamble + 5 area-parameter words
+-  XFER_ROWS,        // single CS: WRITE preamble + row pixel data (time-sliced)
+-  XFER_AREA_END,    // single CS: CMD preamble + TCON_LD_IMG_END
++  XFER_RECTS,       // LD_IMG_AREA, rows, LD_IMG_END for each of rects_ (time-sliced)
+   DPY_BUF_CMD,      // single CS: CMD preamble + I80_CMD_DPY_BUF_AREA
+   DPY_BUF_ARGS,     // single CS: WRITE preamble + 7 display-area words
+   GPIO_RESET_LOW,   // drive RESET pin low
+@@ -131,9 +128,13 @@
+   INIT_DONE,      // allocate framebuffer; transition to IDLE
+   // Update flow
+   UPDATE_PREPARE,   // do_update_, compute dirty region, decide 4bpp/1bpp
+-  UPDATE_TRANSFER,  // one LD_IMG_AREA, time-sliced row streaming, one LD_IMG_END
++  UPDATE_TRANSFER,  // per rect: LD_IMG_AREA, time-sliced row streaming, LD_IMG_END
+   UPDATE_REFRESH,   // wait LUT idle, optionally enable 1bpp, send DPY_BUF_AREA
+   UPDATE_SLEEP,     // optional deep sleep
++  // Preload (set_preload_source), only while no update is pending
++  PRELOAD_WAIT,      // wake, then wait for the LUTs to go idle
++  PRELOAD_TRANSFER,  // stream the source into controller RAM, no display
++  PRELOAD_DONE,      // optional deep sleep
+ };
+ 
+ class IT8951Display : public Display,
+@@ -200,6 +201,26 @@
    int get_width() override { return (this->effective_transform_ & TRANSFORM_SWAP_XY) ? this->height_ : this->width_; }
    int get_height() override { return (this->effective_transform_ & TRANSFORM_SWAP_XY) ? this->width_ : this->height_; }
    bool pixel_axes_swapped() const override { return this->effective_transform_ & TRANSFORM_SWAP_XY; }
 +  bool draw_gray4_packed(int x_start, int y_start, int w, int h, const uint8_t *src, size_t src_stride) override;
++
++  // Preload: a full-panel 4bpp image, in the layout draw_gray4_packed() takes,
++  // that the driver streams into the controller's RAM whenever it is idle,
++  // without displaying it. A later full-panel blit of the same source then
++  // only has to send what changed since and what is drawn over it. Setting
++  // the same source again is a no-op, so drop it before its content changes
++  // (a re-decode writes in place) and set it again after. `tag` is any
++  // caller-chosen id, for drop_preload_source(). Never called, nothing is
++  // allocated and every update transfers as it did without the preload.
++  void set_preload_source(const uint8_t *src, size_t stride, uint8_t tag);
++  void drop_preload_source(uint8_t tag) {
++    if (this->preload_tag_ == tag)
++      this->set_preload_source(nullptr, 0, 0);
++  }
++  void set_preload_enabled(bool enabled) {
++    this->preload_enabled_ = enabled;
++    if (!enabled)
++      this->set_preload_source(nullptr, 0, 0);
++  }
  
   protected:
    // Bulk pixel blit (used by LVGL and image rendering). Overridden to write
+@@ -219,6 +240,23 @@
+   void apply_transform_(int &x, int &y) const;
+   bool rotate_coordinates_(int &x, int &y);
+   void reset_dirty_region_();
++  // Grow the dirty box, and after an adoption mark drawn_; native, end exclusive.
++  void mark_drawn_(int x0, int y0, int x1, int y1);
++  bool packed_rows_ok_() const;
++
++  enum class RectStep : uint8_t { OPEN, ARGS, ROWS, END };
++  size_t block_count_() const { return static_cast<size_t>(this->block_cols_) * this->block_rows_; }
++  void set_blocks_(uint8_t *map, int x0, int y0, int x1, int y1, uint8_t value) const;
++  void build_update_rects_();
++  void rects_from_drawn_();
++  void mark_rects_stale_();
++  void begin_rects_();
++  bool stream_rows_(const Rect &r, uint32_t start_time, bool preload);
++  void account_preload_(const Rect &r);
++  bool allocate_preload_();
++  void invalidate_preload_();
++  bool preload_wanted_() const;
++  void start_preload_();
+ 
+   // --- Framebuffer geometry / monochrome packing ---
+   // Bytes per row for the configured pixel format: 4bpp grayscale packs two
+@@ -254,11 +292,11 @@
+ 
+   // --- Compound Ops (small bounded helpers) ---
+   void op_xfer_lisar_();
+-  void op_xfer_area_args_();
+-  void op_xfer_area_end_();
+-  bool op_xfer_rows_();  // returns true when current update area fully sent
++  void op_xfer_area_args_(const Rect &r);
++  bool op_xfer_rects_();  // returns true when every rect is sent
+   void op_dpy_buf_args_();
+   void op_check_lut_idle_();
++  void enqueue_lut_idle_poll_();
+   void op_set_1bpp_();
+ 
+   // --- Phase enqueuers ---
+@@ -266,6 +304,7 @@
+   void enqueue_init_dev_info_();
+   void enqueue_init_vcom_();
+   void enqueue_init_temp_();
++  void enqueue_wake_();
+   void enqueue_update_transfer_();
+   void enqueue_update_refresh_();
+   void enqueue_update_sleep_();
+@@ -339,6 +378,31 @@
+   // Dirty region (pixel coordinates of bounding box of changes since last update)
+   uint16_t x_low_{0}, y_low_{0}, x_high_{0}, y_high_{0};
+ 
++  // The areas the current transfer loads, and where it is in them.
++  std::vector<Rect> rects_;
++  size_t rect_idx_{0};
++  RectStep rect_step_{RectStep::OPEN};
++  // Rows of a narrow area, or the mirrored preload rows, gathered for one write.
++  uint8_t *stage_{nullptr};
++  // One byte per native block (BLOCK_W x BLOCK_H in it8951.cpp), both in one
++  // allocation. drawn_: written since an adoption. stale_: controller RAM not
++  // known to hold the preload source there.
++  uint8_t *drawn_{nullptr};
++  uint8_t *stale_{nullptr};
++  uint16_t block_cols_{0};
++  uint16_t block_rows_{0};
++  // Set by a full-panel blit of the preload source: this update loads drawn_
++  // only, not its whole area.
++  bool adopted_{false};
++  const uint8_t *preload_src_{nullptr};
++  size_t preload_stride_{0};
++  uint8_t preload_tag_{0};
++  // Set by every invalidation, so a preload streaming an old source stops.
++  bool preload_restarted_{false};
++  bool preload_enabled_{true};
++  // Rows [0, preload_row_) are loaded; always a whole block row.
++  uint16_t preload_row_{0};
++
+   // Saved data rate so we can probe slow then run fast
+   uint32_t configured_data_rate_{0};
+ 

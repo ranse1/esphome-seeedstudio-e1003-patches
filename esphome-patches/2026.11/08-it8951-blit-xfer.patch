@@ -1,52 +1,629 @@
 --- a/esphome/components/it8951/it8951.cpp
 +++ b/esphome/components/it8951/it8951.cpp
-@@ -15,6 +15,9 @@
- // Soft cap for time spent in a single XFER_ROWS Op so we yield back to the
+@@ -12,9 +12,54 @@
+ 
+ ESPHOME_LOG_TAG(TAG, "it8951");
+ 
+-// Soft cap for time spent in a single XFER_ROWS Op so we yield back to the
++// Soft cap for time spent in a single XFER_RECTS Op so we yield back to the
  // loop within one tick budget.
  static constexpr uint32_t MAX_TRANSFER_TIME_MS = 20;
 +// The SPI delegate's largest single transaction (MAX_TRANSFER_SIZE in
 +// spi_esp_idf.cpp); bigger writes are split there anyway.
 +static constexpr uint16_t XFER_BATCH_BYTES = 4092;
++// Preload bookkeeping grid, in native pixels. 32 is the controller's partial
++// refresh x snap; 16 rows keep an overlay's share of a switch small.
++static constexpr uint16_t BLOCK_W = 32;
++static constexpr uint16_t BLOCK_H = 16;
++
++// Copies one 4bpp run of run_bytes bytes into d, mirrored or not; the blit and
++// the preload share it, so a preloaded page is byte-identical to the same page
++// blitted.
++//
++// Mirroring an even-width 4bpp run is a byte reversal plus a nibble swap.
++// Source byte i holds x = 2i in the high nibble and x = 2i+1 in the low.
++// With an even run start and even W, mirroring flips the parity of every x:
++//   x = 2i    -> odd  -> LOW  nibble of run byte w/2-1-i
++//   x = 2i+1  -> even -> HIGH nibble of run byte w/2-1-i
++// Both land in the same destination byte, with their nibbles exchanged.
++//
++// Four bytes at a time when both ends are word aligned (a full-width image,
++// or x and width in multiples of 8):
++// byte-reverse the word, then swap nibbles in all four bytes at once. The
++// S3 itself tolerates unaligned loads, but the compiler assumes a uint32_t
++// access is aligned, so other runs take the byte loop. may_alias because
++// the buffers are uint8_t and the build keeps strict aliasing on.
++static inline void HOT copy_run4(uint8_t *d, const uint8_t *s, size_t run_bytes, bool mirror_x) {
++  if (!mirror_x) {
++    std::memcpy(d, s, run_bytes);
++    return;
++  }
++  typedef uint32_t __attribute__((may_alias)) aliased_u32;
++  if (((reinterpret_cast<uintptr_t>(s) | reinterpret_cast<uintptr_t>(d) | run_bytes) & 3u) == 0) {
++    const aliased_u32 *sw = reinterpret_cast<const aliased_u32 *>(s);
++    aliased_u32 *dw = reinterpret_cast<aliased_u32 *>(d + run_bytes - 4);
++    for (size_t i = 0; i < run_bytes; i += 4, sw++, dw--) {
++      const uint32_t v = __builtin_bswap32(*sw);
++      *dw = ((v & 0x0F0F0F0Fu) << 4) | ((v >> 4) & 0x0F0F0F0Fu);
++    }
++    return;
++  }
++  for (size_t i = 0; i < run_bytes; i++) {
++    const uint8_t b = s[i];
++    d[run_bytes - 1 - i] = static_cast<uint8_t>((b << 4) | (b >> 4));
++  }
++}
  
  // --- Loop / scheduling -------------------------------------------------------
  
-@@ -619,10 +622,16 @@
-   // Each source row is a contiguous slice of the framebuffer in both formats —
-   // the buffer already holds the wire bytes — so stream it straight to SPI with
-   // no per-pixel packing or temporary buffer.
-+  // A full-width area is one contiguous run, so send whole rows in batches: each
-+  // write_array() is an SPI transaction with its own setup and PSRAM cache sync,
-+  // and a full frame is 1404 of them one row at a time.
+@@ -45,10 +90,7 @@
+   // Nothing queued — either the current phase has more work to enqueue, or
+   // we're done.
+   if (this->queue_.empty()) {
+-    if (this->phase_ == Phase::IDLE) {
+-      this->disable_loop();
+-      return;
+-    }
++    // From IDLE this starts a pending update or a preload, or disables the loop.
+     this->advance_phase_();
+     if (this->queue_.empty())
+       return;
+@@ -105,26 +147,12 @@
+     case OpType::XFER_LISAR:
+       this->op_xfer_lisar_();
+       break;
+-    case OpType::XFER_AREA_CMD:
+-      this->spi_cmd_(TCON_LD_IMG_AREA);
+-      break;
+-    case OpType::XFER_AREA_ARGS:
+-      this->op_xfer_area_args_();
+-      break;
+-    case OpType::XFER_ROWS:
+-      // Stream rows into the single open LD_IMG_AREA load. The load stays open
+-      // across loop iterations (CS toggles between bursts, matching the
+-      // reference driver), so a partial slice just re-queues another XFER_ROWS
+-      // pass to resume; only when all rows are sent do we close it with one
+-      // LD_IMG_END. This avoids an LD_IMG_END / LD_IMG_AREA round-trip per slice.
+-      if (this->op_xfer_rows_()) {
+-        this->enqueue_(OpType::XFER_AREA_END);
+-      } else {
+-        this->enqueue_(OpType::XFER_ROWS);
+-      }
+-      break;
+-    case OpType::XFER_AREA_END:
+-      this->op_xfer_area_end_();
++    case OpType::XFER_RECTS:
++      // A load stays open across loop iterations (CS toggles between bursts,
++      // matching the reference driver), so a partial slice just re-queues
++      // another pass to resume.
++      if (!this->op_xfer_rects_())
++        this->enqueue_(OpType::XFER_RECTS);
+       break;
+     case OpType::DPY_BUF_CMD:
+       // Some panel firmwares (notably Seeed reTerminal E1003) silently drop
+@@ -179,6 +207,8 @@
+         this->update_started_at_ = millis();
+         this->set_phase_(Phase::UPDATE_PREPARE);
+         this->advance_phase_();
++      } else if (this->preload_wanted_()) {
++        this->start_preload_();
+       } else {
+         this->disable_loop();
+       }
+@@ -270,6 +300,7 @@
+     }
+ 
+     case Phase::UPDATE_TRANSFER:
++      this->mark_rects_stale_();
+       this->set_phase_(Phase::UPDATE_REFRESH);
+       this->enqueue_update_refresh_();
+       break;
+@@ -288,8 +319,39 @@
+       break;
+ 
+     case Phase::UPDATE_SLEEP:
+-      ESP_LOGV(TAG, "Update took %" PRIu32 "ms (mode=%u area=%ux%u@%u,%u)", millis() - this->update_started_at_,
+-               static_cast<unsigned>(this->active_mode_), this->area_w_, this->area_h_, this->area_x_, this->area_y_);
++      ESP_LOGV(TAG, "Update took %" PRIu32 "ms (mode=%u area=%ux%u@%u,%u, %u loads)", millis() - this->update_started_at_,
++               static_cast<unsigned>(this->active_mode_), this->area_w_, this->area_h_, this->area_x_, this->area_y_,
++               static_cast<unsigned>(this->rects_.size()));
++      this->set_phase_(Phase::IDLE);
++      this->advance_phase_();
++      break;
++
++    case Phase::PRELOAD_WAIT:
++      this->set_phase_(Phase::PRELOAD_TRANSFER);
++      // Before the early out too: the Preload line reads where it started here.
++      this->rects_.clear();
++      this->rects_.emplace_back(0, this->preload_row_, this->width_, this->height_ - this->preload_row_);
++      if (this->update_pending_ || !this->preload_wanted_()) {
++        this->advance_phase_();
++        return;
++      }
++      this->preload_restarted_ = false;
++      this->begin_rects_();
++      this->enqueue_(OpType::XFER_LISAR);
++      this->enqueue_(OpType::XFER_RECTS);
++      break;
++
++    case Phase::PRELOAD_TRANSFER:
++      ESP_LOGV(TAG, "Preload rows %u-%u %s after %" PRIu32 "ms", this->rects_.front().y, this->preload_row_,
++               this->preload_row_ >= this->height_ ? LOG_STR_LITERAL("done") : LOG_STR_LITERAL("paused"),
++               millis() - this->update_started_at_);
++      this->set_phase_(Phase::PRELOAD_DONE);
++      // An update waiting for the preload is about to wake the controller again.
++      if (!this->update_pending_)
++        this->enqueue_update_sleep_();
++      break;
++
++    case Phase::PRELOAD_DONE:
+       this->set_phase_(Phase::IDLE);
+       this->advance_phase_();
+       break;
+@@ -409,7 +471,7 @@
+ 
+ // --- Update op enqueuers -----------------------------------------------------
+ 
+-void IT8951Display::enqueue_update_transfer_() {
++void IT8951Display::enqueue_wake_() {
+   // If the controller was put to sleep after the previous update, wake it
+   // before touching the display engine. TCON_SLEEP gates off all clocks; a
+   // register read (e.g. the LUTAFSR poll in UPDATE_REFRESH) returns a frozen
+@@ -421,23 +483,20 @@
+     this->enqueue_(OpType::DELAY_MS, 10);  // clocks settle after SYS_RUN
+     this->asleep_ = false;
+   }
+-  this->transfer_row_ = 0;
+-  // Open a single LD_IMG_AREA load for the whole region. XFER_ROWS streams into
+-  // it across as many time-sliced passes as needed and emits the one matching
+-  // LD_IMG_END when the last row is sent (see the XFER_ROWS handler).
++}
++
++void IT8951Display::enqueue_update_transfer_() {
++  this->enqueue_wake_();
++  // One LD_IMG_AREA load per rect (build_update_rects_), each streamed across
++  // as many time-sliced passes as needed and closed by its own LD_IMG_END.
++  this->begin_rects_();
+   this->enqueue_(OpType::XFER_LISAR);
+-  this->enqueue_(OpType::XFER_AREA_CMD);
+-  this->enqueue_(OpType::XFER_AREA_ARGS);
+-  this->enqueue_(OpType::XFER_ROWS);
++  this->enqueue_(OpType::XFER_RECTS);
+ }
+ 
+ void IT8951Display::enqueue_update_refresh_() {
+   ESP_LOGV(TAG, "Enqueueing refresh ops: grayscale=%u", this->grayscale_);
+-  // Poll LUT idle: CMD(REG_RD) → WRITE_W(LUTAFSR) → READ_WORD → CHECK_LUT_IDLE
+-  this->enqueue_(OpType::CMD, TCON_REG_RD);
+-  this->enqueue_(OpType::WRITE_W, LUTAFSR);
+-  this->enqueue_(OpType::READ_WORD);
+-  this->enqueue_(OpType::CHECK_LUT_IDLE);
++  this->enqueue_lut_idle_poll_();
+   if (!this->grayscale_) {
+     // Read UP1SR+2: CMD(REG_RD) → WRITE_W(UP1SR+2) → READ_WORD → SET_1BPP
+     this->enqueue_(OpType::CMD, TCON_REG_RD);
+@@ -449,8 +508,17 @@
+   this->enqueue_(OpType::DPY_BUF_ARGS);
+ }
+ 
++// CMD(REG_RD) → WRITE_W(LUTAFSR) → READ_WORD → CHECK_LUT_IDLE, which re-polls until LUTAFSR reads 0.
++void IT8951Display::enqueue_lut_idle_poll_() {
++  this->enqueue_(OpType::CMD, TCON_REG_RD);
++  this->enqueue_(OpType::WRITE_W, LUTAFSR);
++  this->enqueue_(OpType::READ_WORD);
++  this->enqueue_(OpType::CHECK_LUT_IDLE);
++}
++
+ void IT8951Display::enqueue_update_sleep_() {
+-  if (this->sleep_when_done_) {
++  // A preload starts as soon as this update ends, and would only wake it again.
++  if (this->sleep_when_done_ && !this->preload_wanted_()) {
+     this->enqueue_(OpType::CMD, TCON_SLEEP);
+     // Remember that the controller is now asleep so the next update wakes it
+     // (see enqueue_update_transfer_) before polling any register.
+@@ -571,64 +639,127 @@
+   this->prepend_(OpType::CMD, TCON_REG_WR, 0);
+ }
+ 
+-void IT8951Display::op_xfer_area_args_() {
+-  // Single CS transaction: WRITE preamble + 5 area-parameter words describing
+-  // the full update region. Sent once when the load is opened (transfer_row_ is
+-  // 0); XFER_ROWS then streams every row into this one area.
++void IT8951Display::op_xfer_area_args_(const Rect &r) {
++  // Single CS transaction: WRITE preamble + 5 area-parameter words.
+   uint16_t args[5];
+   if (this->grayscale_) {
+     args[0] = static_cast<uint16_t>((LDIMG_B_ENDIAN << 8) | (PIXEL_4BPP << 4));
+-    args[1] = this->area_x_;
+-    args[2] = this->area_y_;
+-    args[3] = this->area_w_;
+-    args[4] = this->area_h_;
++    args[1] = r.x;
++    args[2] = r.y;
++    args[3] = r.w;
++    args[4] = r.h;
+   } else {
+     // Monochrome is loaded via the 8bpp-packed trick: x and width are expressed
+     // in bytes (8 pixels each) and the controller unpacks one bit per pixel.
+     args[0] = static_cast<uint16_t>((LDIMG_L_ENDIAN << 8) | (PIXEL_8BPP << 4));
+-    args[1] = static_cast<uint16_t>(this->area_x_ / 8);
+-    args[2] = this->area_y_;
+-    args[3] = static_cast<uint16_t>(this->area_w_ / 8);
+-    args[4] = this->area_h_;
++    args[1] = static_cast<uint16_t>(r.x / 8);
++    args[2] = r.y;
++    args[3] = static_cast<uint16_t>(r.w / 8);
++    args[4] = r.h;
+   }
+   this->spi_write_args_(args, 5);
+ }
+ 
+-void IT8951Display::op_xfer_area_end_() { this->spi_cmd_(TCON_LD_IMG_END); }
++void IT8951Display::begin_rects_() {
++  this->rect_idx_ = 0;
++  this->rect_step_ = RectStep::OPEN;
++}
+ 
+-bool IT8951Display::op_xfer_rows_() {
++bool IT8951Display::op_xfer_rects_() {
+   const uint32_t start_time = millis();
+-  const uint16_t area_y = this->area_y_;
+-  const uint16_t area_h = this->area_h_;
++  const bool preload = this->phase_ == Phase::PRELOAD_TRANSFER;
++  bool done = false;
++  while (true) {
++    if (this->rect_idx_ >= this->rects_.size()) {
++      done = true;
++      break;
++    }
++    // Every command waits for HW_RDY; a busy controller hands the wait to the
++    // loop gate instead of spinning here.
++    if (this->is_busy_())
++      break;
++    // A preload gives way to any update, and stops for a new source; it
++    // resumes from its last whole block row. It is a single rect, so closing
++    // the open load ends it.
++    const bool yield = preload && (this->update_pending_ || this->preload_restarted_);
++    const Rect &r = this->rects_[this->rect_idx_];
++    if (this->rect_step_ == RectStep::OPEN) {
++      if (yield) {
++        done = true;
++        break;
++      }
++      this->spi_cmd_(TCON_LD_IMG_AREA);
++      this->rect_step_ = RectStep::ARGS;
++    } else if (this->rect_step_ == RectStep::ARGS) {
++      this->op_xfer_area_args_(r);
++      this->transfer_row_ = 0;
++      this->rect_step_ = RectStep::ROWS;
++    } else if (this->rect_step_ == RectStep::ROWS) {
++      if (yield) {
++        this->rect_step_ = RectStep::END;
++        continue;
++      }
++      const bool rect_done = this->stream_rows_(r, start_time, preload);
++      if (preload)
++        this->account_preload_(r);
++      if (!rect_done)
++        break;
++      this->rect_step_ = RectStep::END;
++    } else {
++      this->spi_cmd_(TCON_LD_IMG_END);
++      this->rect_step_ = RectStep::OPEN;
++      this->rect_idx_++;
++    }
++    if (millis() - start_time >= MAX_TRANSFER_TIME_MS)
++      break;
++  }
+ 
+-  // Bytes per source row, and the byte offset of area_x within a row, in the
+-  // framebuffer's native packing. These match the per-row byte count the
+-  // controller expects from op_xfer_area_args_: area_w/2 for 4bpp grayscale,
+-  // area_w/8 for the 1bpp-packed monochrome trick. area_x / area_w are
+-  // 16-pixel aligned (see prepare_update_region_), so both divisions are exact.
+-  const uint16_t bytes_per_row =
+-      this->grayscale_ ? static_cast<uint16_t>(this->area_w_ >> 1) : static_cast<uint16_t>(this->area_w_ >> 3);
+-  const uint16_t row_x_bytes =
+-      this->grayscale_ ? static_cast<uint16_t>(this->area_x_ >> 1) : static_cast<uint16_t>(this->area_x_ >> 3);
++  return done;
++}
++
++bool IT8951Display::stream_rows_(const Rect &r, uint32_t start_time, bool preload) {
++  // Bytes per row and the byte offset of r.x, in the framebuffer's native
++  // packing: w/2 for 4bpp grayscale, w/8 for the 1bpp-packed monochrome trick.
++  // Rects are 16-pixel aligned, so both divisions are exact.
++  const uint16_t bytes_per_row = this->grayscale_ ? static_cast<uint16_t>(r.w >> 1) : static_cast<uint16_t>(r.w >> 3);
++  const uint16_t row_x_bytes = this->grayscale_ ? static_cast<uint16_t>(r.x >> 1) : static_cast<uint16_t>(r.x >> 3);
++  // The preload sends the rows draw_gray4_packed() would write for a full-panel
++  // blit of its source, so it reads them from there with the blit's mirroring.
++  const uint8_t *base = (preload ? this->preload_src_ : this->buffer_) + row_x_bytes;
++  const size_t stride = preload ? this->preload_stride_ : this->row_width_;
++  const bool mirror_x = preload && (this->effective_transform_ & TRANSFORM_MIRROR_X) != 0;
++  const bool mirror_y = preload && (this->effective_transform_ & TRANSFORM_MIRROR_Y) != 0;
++  // Each write_array() is an SPI transaction with its own setup and PSRAM cache
++  // sync, so rows go in batches: straight from the source when they lie there
++  // contiguous and unmirrored, gathered into stage_ otherwise. Without stage_
++  // (no preload ever set) a narrow area goes one row per write.
++  const bool contiguous = !mirror_x && !mirror_y && bytes_per_row == stride;
++  const bool direct = contiguous || this->stage_ == nullptr;
 +  const uint16_t rows_per_write =
-+      bytes_per_row == this->row_width_ ? std::max<uint16_t>(1, XFER_BATCH_BYTES / bytes_per_row) : 1;
-   while (this->transfer_row_ < area_h) {
-+    const uint16_t rows = std::min<uint16_t>(rows_per_write, area_h - this->transfer_row_);
-     const uint32_t offset = (static_cast<uint32_t>(area_y) + this->transfer_row_) * this->row_width_ + row_x_bytes;
++      contiguous || this->stage_ != nullptr ? std::max<uint16_t>(1, XFER_BATCH_BYTES / bytes_per_row) : 1;
+ 
+-  // Single CS write transaction — HW_RDY was confirmed high by the loop gate.
++  // Single CS write transaction; HW_RDY was confirmed high just before.
+   this->enable();
+   this->write_byte16(PACKET_TYPE_WRITE);
+   wait_for_hardware_ready(this->busy_pin_);
+-
+-  // Each source row is a contiguous slice of the framebuffer in both formats —
+-  // the buffer already holds the wire bytes — so stream it straight to SPI with
+-  // no per-pixel packing or temporary buffer.
+-  while (this->transfer_row_ < area_h) {
+-    const uint32_t offset = (static_cast<uint32_t>(area_y) + this->transfer_row_) * this->row_width_ + row_x_bytes;
 -    this->write_array(&this->buffer_[offset], bytes_per_row);
 -    this->transfer_row_++;
-+    this->write_array(&this->buffer_[offset], static_cast<size_t>(bytes_per_row) * rows);
++  while (this->transfer_row_ < r.h) {
++    const uint16_t rows = std::min<uint16_t>(rows_per_write, r.h - this->transfer_row_);
++    const uint32_t y = static_cast<uint32_t>(r.y) + this->transfer_row_;
++    const uint8_t *src = base + y * stride;
++    if (!direct) {
++      for (uint16_t k = 0; k < rows; k++) {
++        const uint32_t sy = mirror_y ? this->height_ - 1 - (y + k) : y + k;
++        copy_run4(this->stage_ + static_cast<size_t>(k) * bytes_per_row, base + sy * stride, bytes_per_row, mirror_x);
++      }
++      src = this->stage_;
++    }
++    this->write_array(src, static_cast<size_t>(bytes_per_row) * rows);
 +    this->transfer_row_ += rows;
      if (millis() - start_time >= MAX_TRANSFER_TIME_MS)
        break;
    }
-@@ -959,6 +968,96 @@
+-
+   this->disable();
+-  return this->transfer_row_ >= area_h;
++  return this->transfer_row_ >= r.h;
+ }
+ 
+ void IT8951Display::op_dpy_buf_args_() {
+@@ -656,8 +787,9 @@
+ 
+ void IT8951Display::op_check_lut_idle_() {
+   ESP_LOGV(TAG, "Checking LUT idle, read_result_=0x%04X", this->read_result_);
+-  // read_result_ holds LUTAFSR value from the preceding READ_WORD op.
+-  if (this->read_result_ != 0) {
++  // read_result_ holds LUTAFSR value from the preceding READ_WORD op. A preload
++  // stops waiting once an update is pending; the update waits for idle itself.
++  if (this->read_result_ != 0 && !(this->phase_ == Phase::PRELOAD_WAIT && this->update_pending_)) {
+     // LUT still busy — re-enqueue the full read sequence after a short delay.
+     this->prepend_(OpType::CHECK_LUT_IDLE, 0, 0);
+     this->prepend_(OpType::READ_WORD, 0, 0);
+@@ -743,6 +875,7 @@
+   if (!full_update && mode == UPDATE_MODE_GC16 && !this->grayscale_)
+     mode = UPDATE_MODE_DU;
+ 
++  this->build_update_rects_();
+   this->reset_dirty_region_();
+ 
+   ESP_LOGV(TAG, "Update: %ux%u@%u,%u mode=%u (%s)", width, height, x, y, static_cast<unsigned>(mode),
+@@ -755,6 +888,147 @@
+   this->x_high_ = 0;
+   this->y_low_ = this->height_;
+   this->y_high_ = 0;
++  // drawn_ is only read after an adoption, which rewrites all of it.
++  this->adopted_ = false;
++}
++
++void IT8951Display::mark_drawn_(int x0, int y0, int x1, int y1) {
++  if (x1 <= x0 || y1 <= y0)
++    return;
++  this->x_low_ = clamp_at_most(this->x_low_, static_cast<uint16_t>(x0));
++  this->x_high_ = clamp_at_least(this->x_high_, static_cast<uint16_t>(x1));
++  this->y_low_ = clamp_at_most(this->y_low_, static_cast<uint16_t>(y0));
++  this->y_high_ = clamp_at_least(this->y_high_, static_cast<uint16_t>(y1));
++  if (this->adopted_)
++    this->set_blocks_(this->drawn_, x0, y0, x1, y1, 1);
++}
++
++void IT8951Display::set_blocks_(uint8_t *map, int x0, int y0, int x1, int y1, uint8_t value) const {
++  if (map == nullptr || x1 <= x0 || y1 <= y0)
++    return;
++  const int bx0 = x0 / BLOCK_W;
++  const int bx1 = (x1 + BLOCK_W - 1) / BLOCK_W;
++  for (int by = y0 / BLOCK_H; by < (y1 + BLOCK_H - 1) / BLOCK_H; by++)
++    std::memset(map + static_cast<size_t>(by) * this->block_cols_ + bx0, value, bx1 - bx0);
++}
++
++void IT8951Display::build_update_rects_() {
++  this->rects_.clear();
++  if (this->adopted_) {
++    this->rects_from_drawn_();
++  } else {
++    this->rects_.emplace_back(this->area_x_, this->area_y_, this->area_w_, this->area_h_);
++  }
++}
++
++// One load per run of drawn blocks in a block row, extended downwards while the
++// run keeps its span, so an overlay costs one load rather than one per row.
++// Only after an adoption, whose area is always the whole panel.
++void IT8951Display::rects_from_drawn_() {
++  for (int by = 0; by < this->block_rows_; by++) {
++    const int16_t y0 = by * BLOCK_H;
++    const int16_t h = std::min<int>(BLOCK_H, this->height_ - y0);
++    const uint8_t *row = this->drawn_ + static_cast<size_t>(by) * this->block_cols_;
++    for (int bx = 0; bx < this->block_cols_;) {
++      if (row[bx] == 0) {
++        bx++;
++        continue;
++      }
++      const int bx0 = bx;
++      while (bx < this->block_cols_ && row[bx] != 0)
++        bx++;
++      const int16_t x0 = bx0 * BLOCK_W;
++      const int16_t w = std::min<int>(bx * BLOCK_W, this->width_) - x0;
++      auto above = std::find_if(this->rects_.begin(), this->rects_.end(),
++                                [&](const Rect &r) { return r.x == x0 && r.w == w && r.y2() == y0; });
++      if (above != this->rects_.end()) {
++        above->h += h;
++      } else {
++        this->rects_.emplace_back(x0, y0, w, h);
++      }
++    }
++  }
++}
++
++// A load of the whole panel (a full paint, or the driver's own periodic full
++// update) leaves nothing of the preload. Anything smaller is left for the next
++// switch to send.
++void IT8951Display::mark_rects_stale_() {
++  for (const Rect &r : this->rects_) {
++    if (r.w == this->width_ && r.h == this->height_) {
++      this->invalidate_preload_();
++      return;
++    }
++    this->set_blocks_(this->stale_, r.x, r.y, r.x2(), r.y2(), 1);
++  }
++}
++
++void IT8951Display::account_preload_(const Rect &r) {
++  const int loaded = r.y + this->transfer_row_;
++  const int whole = loaded >= this->height_ ? this->height_ : loaded / BLOCK_H * BLOCK_H;
++  this->set_blocks_(this->stale_, 0, this->preload_row_, this->width_, whole, 0);
++  this->preload_row_ = whole;
++}
++
++void IT8951Display::invalidate_preload_() {
++  this->preload_row_ = 0;
++  this->preload_restarted_ = true;
++  this->set_blocks_(this->stale_, 0, 0, this->width_, this->height_, 1);
++}
++
++bool IT8951Display::preload_wanted_() const {
++  return this->initialised_ && this->preload_src_ != nullptr && this->preload_row_ < this->height_;
++}
++
++void IT8951Display::start_preload_() {
++  // The Preload line times from here; the update has logged.
++  this->update_started_at_ = millis();
++  this->set_phase_(Phase::PRELOAD_WAIT);
++  this->enqueue_wake_();
++  // Nothing says the LUT engine is done with controller RAM before its
++  // waveform ends, so the load waits for that. It is background work anyway.
++  this->enqueue_lut_idle_poll_();
++}
++
++// On first use only, so a display that never preloads keeps its memory and
++// loads every update's whole area one row at a time, as before.
++bool IT8951Display::allocate_preload_() {
++  if (this->stage_ != nullptr)
++    return true;
++  this->block_cols_ = static_cast<uint16_t>((this->width_ + BLOCK_W - 1) / BLOCK_W);
++  this->block_rows_ = static_cast<uint16_t>((this->height_ + BLOCK_H - 1) / BLOCK_H);
++  RAMAllocator<uint8_t> allocator{};
++  uint8_t *maps = allocator.allocate(2 * this->block_count_());
++  // Internal RAM: the CPU fills it and the DMA reads it with no PSRAM round trip.
++  RAMAllocator<uint8_t> internal(RAMAllocator<uint8_t>::ALLOC_INTERNAL);
++  uint8_t *stage = internal.allocate(XFER_BATCH_BYTES);
++  if (maps == nullptr || stage == nullptr) {
++    ESP_LOGW(TAG, "No memory for the preload buffers; preload off");
++    if (maps != nullptr)
++      allocator.deallocate(maps, 2 * this->block_count_());
++    if (stage != nullptr)
++      internal.deallocate(stage, XFER_BATCH_BYTES);
++    return false;
++  }
++  this->drawn_ = maps;
++  this->stale_ = maps + this->block_count_();
++  this->stage_ = stage;
++  return true;
++}
++
++void IT8951Display::set_preload_source(const uint8_t *src, size_t stride, uint8_t tag) {
++  // The preload reproduces what draw_gray4_packed() writes for a full panel.
++  const bool usable = src != nullptr && this->preload_enabled_ && this->buffer_ != nullptr &&
++                      this->packed_rows_ok_() && stride >= this->row_width_ && this->allocate_preload_();
++  // Same source again: nothing to redo, since a new decode drops it first.
++  if (usable && src == this->preload_src_ && stride == this->preload_stride_ && tag == this->preload_tag_)
++    return;
++  this->preload_src_ = usable ? src : nullptr;
++  this->preload_stride_ = stride;
++  this->preload_tag_ = usable ? tag : 0;
++  this->invalidate_preload_();
++  if (usable && this->phase_ == Phase::IDLE)
++    this->enable_loop();
+ }
+ 
+ void IT8951Display::start_update_(UpdateMode mode) {
+@@ -819,11 +1093,10 @@
+     this->spi_setup();
+   }
+ 
+-  // Force a full redraw on next opportunity.
+-  this->x_low_ = 0;
+-  this->y_low_ = 0;
+-  this->x_high_ = this->width_;
+-  this->y_high_ = this->height_;
++  // Force a full redraw on next opportunity. A reset leaves controller RAM
++  // undefined, so the preload starts over too.
++  this->mark_drawn_(0, 0, this->width_, this->height_);
++  this->invalidate_preload_();
+ 
+   this->set_phase_(Phase::INIT_RESET);
+   this->enqueue_init_reset_();
+@@ -835,6 +1108,8 @@
+ // --- Coordinate transform ----------------------------------------------------
+ 
+ void IT8951Display::update_effective_transform_() {
++  // The preload was mirrored for the old transform.
++  this->set_preload_source(nullptr, 0, 0);
+   switch (this->rotation_) {
+     case DISPLAY_ROTATION_90_DEGREES:
+       this->effective_transform_ = this->transform_ ^ (TRANSFORM_SWAP_XY | TRANSFORM_MIRROR_X);
+@@ -870,6 +1145,8 @@
+   this->x_high_ = clamp_at_least(this->x_high_, x + 1);
+   this->y_low_ = clamp_at_most(this->y_low_, y);
+   this->y_high_ = clamp_at_least(this->y_high_, y + 1);
++  if (this->adopted_)
++    this->drawn_[static_cast<size_t>(y / BLOCK_H) * this->block_cols_ + x / BLOCK_W] = 1;
+   return true;
+ }
+ 
+@@ -924,10 +1201,7 @@
+     fill_byte = (packed <= 0x07) ? 0xFF : 0x00;
+   }
+   memset(this->buffer_, fill_byte, this->buffer_length_);
+-  this->x_low_ = 0;
+-  this->y_low_ = 0;
+-  this->x_high_ = this->width_;
+-  this->y_high_ = this->height_;
++  this->mark_drawn_(0, 0, this->width_, this->height_);
+ }
+ 
+ void HOT IT8951Display::draw_pixel_at(int x, int y, Color color) {
+@@ -959,6 +1233,70 @@
    }
  }
  
-+bool HOT IT8951Display::draw_gray4_packed(int x_start, int y_start, int w, int h, const uint8_t *src,
-+                                          size_t src_stride) {
-+  // Every condition below is a reason the row-wise shortcut cannot be trusted;
-+  // returning false simply sends the caller back to the per-pixel path.
-+  if (this->buffer_ == nullptr || src == nullptr)
-+    return false;
++// Whether 4bpp source rows go into the framebuffer as plain bytes. The blit
++// and the preload both rely on it, and must agree byte for byte.
++bool IT8951Display::packed_rows_ok_() const {
 +  if (!this->grayscale_)
 +    return false;  // monochrome framebuffer packs 8 pixels per byte, not 2
 +  if (this->invert_colors_)
 +    return false;  // a byte copy would skip the 0x0F - n flip write_pixel_native_ applies
-+  if (this->get_clipping().is_set())
-+    return false;  // would need a per-pixel test
 +  if (this->effective_transform_ & TRANSFORM_SWAP_XY)
 +    return false;  // a source row is not a destination row
++  // Mirroring keeps a run byte-aligned only with an even W (draw_gray4_packed).
++  return !(this->effective_transform_ & TRANSFORM_MIRROR_X) || (this->width_ & 1) == 0;
++}
++
++bool HOT IT8951Display::draw_gray4_packed(int x_start, int y_start, int w, int h, const uint8_t *src,
++                                          size_t src_stride) {
++  // Every condition below is a reason the row-wise shortcut cannot be trusted;
++  // returning false simply sends the caller back to the per-pixel path.
++  if (this->buffer_ == nullptr || src == nullptr || !this->packed_rows_ok_())
++    return false;
++  if (this->get_clipping().is_set())
++    return false;  // would need a per-pixel test
 +  // Byte alignment: a source row is two pixels per byte, so the destination
 +  // run must start on an even x and be an even number of pixels wide, or it
 +  // would straddle nibbles and need shifting. With mirror_x the run starts at
@@ -58,8 +635,6 @@
 +    return false;
 +  const bool mirror_x = (this->effective_transform_ & TRANSFORM_MIRROR_X) != 0;
 +  const bool mirror_y = (this->effective_transform_ & TRANSFORM_MIRROR_Y) != 0;
-+  if (mirror_x && (this->width_ & 1) != 0)
-+    return false;
 +
 +  const size_t row_bytes = static_cast<size_t>(this->row_width_);
 +  const size_t run_bytes = static_cast<size_t>(w) >> 1;
@@ -77,52 +652,45 @@
 +      App.feed_wdt();
 +    const uint8_t *s = src + static_cast<size_t>(y) * src_stride;
 +    const int dst_y = mirror_y ? (this->height_ - 1 - (y_start + y)) : (y_start + y);
-+    uint8_t *d = this->buffer_ + static_cast<size_t>(dst_y) * row_bytes + dst_byte0;
-+
-+    if (!mirror_x) {
-+      memcpy(d, s, run_bytes);
-+      continue;
-+    }
-+
-+    // Mirroring an even-width 4bpp run is a byte reversal plus a nibble swap.
-+    //
-+    // Source byte i holds x = 2i in the high nibble and x = 2i+1 in the low.
-+    // With an even run start and even W, mirroring flips the parity of every x:
-+    //   x = 2i    -> odd  -> LOW  nibble of run byte w/2-1-i
-+    //   x = 2i+1  -> even -> HIGH nibble of run byte w/2-1-i
-+    // Both land in the same destination byte, with their nibbles exchanged.
-+    //
-+    // Four bytes at a time when both ends are word aligned (a full-width image,
-+    // or x and width in multiples of 8):
-+    // byte-reverse the word, then swap nibbles in all four bytes at once. The
-+    // S3 itself tolerates unaligned loads, but the compiler assumes a uint32_t
-+    // access is aligned, so other runs take the byte loop. may_alias because
-+    // the buffers are uint8_t and the build keeps strict aliasing on.
-+    typedef uint32_t __attribute__((may_alias)) aliased_u32;
-+    if (((reinterpret_cast<uintptr_t>(s) | reinterpret_cast<uintptr_t>(d) | run_bytes) & 3u) == 0) {
-+      const aliased_u32 *sw = reinterpret_cast<const aliased_u32 *>(s);
-+      aliased_u32 *dw = reinterpret_cast<aliased_u32 *>(d + run_bytes - 4);
-+      for (size_t i = 0; i < run_bytes; i += 4, sw++, dw--) {
-+        const uint32_t v = __builtin_bswap32(*sw);
-+        *dw = ((v & 0x0F0F0F0Fu) << 4) | ((v >> 4) & 0x0F0F0F0Fu);
-+      }
-+    } else {
-+      for (size_t i = 0; i < run_bytes; i++) {
-+        const uint8_t b = s[i];
-+        d[run_bytes - 1 - i] = static_cast<uint8_t>((b << 4) | (b >> 4));
-+      }
-+    }
++    copy_run4(this->buffer_ + static_cast<size_t>(dst_y) * row_bytes + dst_byte0, s, run_bytes, mirror_x);
 +  }
 +
-+  // Grow the dirty box by the blitted region, in native coordinates.
 +  const int dst_y0 = mirror_y ? (this->height_ - y_start - h) : y_start;
-+  this->x_low_ = clamp_at_most(this->x_low_, static_cast<uint16_t>(dst_x0));
-+  this->x_high_ = clamp_at_least(this->x_high_, static_cast<uint16_t>(dst_x0 + w));
-+  this->y_low_ = clamp_at_most(this->y_low_, static_cast<uint16_t>(dst_y0));
-+  this->y_high_ = clamp_at_least(this->y_high_, static_cast<uint16_t>(dst_y0 + h));
++  this->mark_drawn_(dst_x0, dst_y0, dst_x0 + w, dst_y0 + h);
++  // A full-panel blit of the preload source leaves the framebuffer equal to
++  // controller RAM wherever the preload is not stale: only those blocks, and
++  // whatever is drawn after this, need loading.
++  if (src == this->preload_src_ && src_stride == this->preload_stride_ && w == this->width_ && h == this->height_) {
++    std::memcpy(this->drawn_, this->stale_, this->block_count_());
++    this->adopted_ = true;
++  }
 +  return true;
 +}
 +
  void HOT IT8951Display::draw_pixels_internal(int x_start, int y_start, int w, int h, const uint8_t *ptr,
                                               ColorBitness bitness, bool big_endian, int x_offset, int y_offset,
                                               int x_pad) {
+@@ -1015,12 +1353,8 @@
+   const int ny_lo = std::max(0, std::min(y0, y1));
+   const int nx_hi = std::min(this->width_ - 1, std::max(x0, x1));
+   const int ny_hi = std::min(this->height_ - 1, std::max(y0, y1));
+-  if (nx_hi >= nx_lo && ny_hi >= ny_lo) {
+-    this->x_low_ = clamp_at_most(this->x_low_, nx_lo);
+-    this->x_high_ = clamp_at_least(this->x_high_, nx_hi + 1);
+-    this->y_low_ = clamp_at_most(this->y_low_, ny_lo);
+-    this->y_high_ = clamp_at_least(this->y_high_, ny_hi + 1);
+-  }
++  if (nx_hi >= nx_lo && ny_hi >= ny_lo)
++    this->mark_drawn_(nx_lo, ny_lo, nx_hi + 1, ny_hi + 1);
+ }
+ 
+ void IT8951Display::set_mono_pixel_(uint16_t x, uint16_t y, bool value) const {
+@@ -1028,7 +1362,7 @@
+   // controller for the 8bpp-load / 1bpp-display trick (L_ENDIAN). Pixels are
+   // grouped in 16s; on the wire the high byte (pixels 8..15) precedes the low
+   // byte (pixels 0..7), and the bit index within a byte is the pixel's offset
+-  // (LSB = lowest x). Storing in that order lets op_xfer_rows_ copy rows
++  // (LSB = lowest x). Storing in that order lets stream_rows_ copy rows
+   // verbatim with no packing or byte-swapping.
+   const uint16_t group = static_cast<uint16_t>(x >> 4);
+   const uint8_t sub = static_cast<uint8_t>(x & 0x0F);
