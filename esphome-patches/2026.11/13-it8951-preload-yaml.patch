@@ -1,0 +1,122 @@
+--- a/esphome/components/it8951/display.py
++++ b/esphome/components/it8951/display.py
+@@ -7,7 +7,7 @@
+ 
+ from esphome import automation, core, pins
+ import esphome.codegen as cg
+-from esphome.components import display, spi
++from esphome.components import display, image, spi
+ from esphome.components.display import CONF_SHOW_TEST_CARD, validate_rotation
+ import esphome.config_validation as cv
+ from esphome.config_validation import update_interval
+@@ -27,6 +27,7 @@
+     CONF_MODE,
+     CONF_MODEL,
+     CONF_PAGES,
++    CONF_PLATFORM,
+     CONF_RESET_DURATION,
+     CONF_RESET_PIN,
+     CONF_ROTATION,
+@@ -36,6 +37,7 @@
+     CONF_UPDATE_INTERVAL,
+     CONF_WIDTH,
+ )
++from esphome.core import CORE
+ from esphome.cpp_generator import RawExpression
+ from esphome.types import ConfigType
+ 
+@@ -49,6 +51,18 @@
+ CONF_DITHERING = "dithering"
+ CONF_UPDATE_MODE = "update_mode"
+ CONF_USE_LEGACY_DPY_AREA = "use_legacy_dpy_area"
++CONF_PRELOAD = "preload"
++CONF_HOME = "home"
++CONF_NEXT = "next"
++
++# `preload:` lets the driver keep the likeliest next page loaded in the
++# controller: `next` while `home` is on screen, `home` while anything else is.
++PRELOAD_SCHEMA = cv.Schema(
++    {
++        cv.Required(CONF_HOME): cv.use_id(image.Image_),
++        cv.Optional(CONF_NEXT): cv.use_id(image.Image_),
++    }
++)
+ 
+ # VCOM SET sub-command selectors. The IT8951 firmware accepts different
+ # values across panels; most respond to 0x0001, but a few — e.g. the Seeed
+@@ -272,6 +286,7 @@
+                 default=model.get_default(CONF_USE_LEGACY_DPY_AREA, False),
+             ): cv.boolean,
+             cv.Optional(CONF_UPDATE_MODE): update_mode,
++            cv.Optional(CONF_PRELOAD): PRELOAD_SCHEMA,
+             # One or more GPIOs driven high during setup to power on the panel
+             # (e.g. board power-enable rails), before reset and init.
+             **display.enable_pin_schema(model, config),
+@@ -345,6 +360,13 @@
+         config
+     )
+ 
++    if CONF_PRELOAD in config:
++        if not config[CONF_GRAYSCALE]:
++            raise cv.Invalid("preload needs grayscale: true", path=[CONF_PRELOAD])
++        if config.get(CONF_ROTATION, 0) in (90, 270) or config.get(CONF_TRANSFORM, {}).get(CONF_SWAP_XY):
++            raise cv.Invalid("preload does not work with the axes swapped (rotation 90/270, swap_xy)",
++                             path=[CONF_PRELOAD])
++
+     if CONF_LAMBDA not in config and CONF_PAGES not in config:
+         if display.has_external_writer(config[CONF_ID]):
+             if CONF_UPDATE_INTERVAL not in config:
+@@ -402,6 +424,53 @@
+     if transform_value:
+         cg.add(var.set_transform(RawExpression(str(transform_value))))
+ 
++    if preload := config.get(CONF_PRELOAD):
++        await _preload_to_code(var, preload, width, height)
++
++
++def _image_platform(image_id) -> str | None:
++    for conf in CORE.config.get("image", []):
++        if str(conf.get(CONF_ID)) == str(image_id):
++            return conf.get(CONF_PLATFORM)
++    return None
++
++
++async def _preload_to_code(var, preload: ConfigType, width: int, height: int) -> None:
++    pages = []
++    for page, key in enumerate((CONF_HOME, CONF_NEXT), start=1):
++        if key not in preload:
++            pages.append(cg.nullptr)
++            continue
++        image_id = preload[key]
++        img = await cg.get_variable(image_id)
++        # Image metadata exists only once the image's own codegen ran, so this
++        # check cannot live in the config validation. An online_image without
++        # `resize:` reports 0x0: its size is only known after a download.
++        meta = image.get_image_metadata(str(image_id))
++        size_known = meta is not None and meta.width and meta.height
++        if meta is not None and (
++            (size_known and (meta.width != width or meta.height != height))
++            or str(meta.image_type).upper() != "GRAYSCALE_4BIT"
++            or str(meta.transparency).lower() != "opaque"
++        ):
++            raise core.EsphomeError(
++                f"preload {key}: '{image_id}' must be an opaque GRAYSCALE_4BIT image of "
++                f"exactly {width}x{height}, the panel's size; it is {meta.width}x{meta.height}, "
++                f"{meta.image_type}, {meta.transparency}"
++            )
++        pages.append(img)
++        # A download decodes into the same buffer: the driver must hear of it
++        # before the first byte is written, and again once the image is whole.
++        if _image_platform(image_id) == "online_image":
++            for hook, args in (
++                ("add_on_download_started_callback", ""),
++                ("add_on_finished_callback", "bool"),
++                ("add_on_error_callback", ""),
++            ):
++                call = "changing" if hook == "add_on_download_started_callback" else "changed"
++                cg.add(RawExpression(f"{img}->{hook}([]({args}) {{ {var}->preload_page_{call}({page}); }})"))
++    cg.add(var.set_preload_pages(*pages))
++
+ 
+ automation.register_apply_action(
+     "it8951.update",

@@ -56,7 +56,20 @@
  
  // --- Loop / scheduling -------------------------------------------------------
  
-@@ -45,10 +90,7 @@
+@@ -38,6 +83,12 @@
+ }
+ 
+ void IT8951Display::loop() {
++#ifdef USE_IMAGE
++  if (this->preload_reselect_) {
++    this->preload_reselect_ = false;
++    this->select_preload_page_();
++  }
++#endif
+   const uint32_t now = millis();
+   if (static_cast<int32_t>(now - this->delay_until_) < 0)
+     return;
+@@ -45,10 +96,7 @@
    // Nothing queued — either the current phase has more work to enqueue, or
    // we're done.
    if (this->queue_.empty()) {
@@ -68,7 +81,7 @@
      this->advance_phase_();
      if (this->queue_.empty())
        return;
-@@ -105,26 +147,12 @@
+@@ -105,26 +153,12 @@
      case OpType::XFER_LISAR:
        this->op_xfer_lisar_();
        break;
@@ -101,7 +114,7 @@
        break;
      case OpType::DPY_BUF_CMD:
        // Some panel firmwares (notably Seeed reTerminal E1003) silently drop
-@@ -179,6 +207,8 @@
+@@ -179,6 +213,8 @@
          this->update_started_at_ = millis();
          this->set_phase_(Phase::UPDATE_PREPARE);
          this->advance_phase_();
@@ -110,7 +123,7 @@
        } else {
          this->disable_loop();
        }
-@@ -270,6 +300,7 @@
+@@ -270,6 +306,7 @@
      }
  
      case Phase::UPDATE_TRANSFER:
@@ -118,7 +131,7 @@
        this->set_phase_(Phase::UPDATE_REFRESH);
        this->enqueue_update_refresh_();
        break;
-@@ -288,8 +319,39 @@
+@@ -288,8 +325,39 @@
        break;
  
      case Phase::UPDATE_SLEEP:
@@ -160,7 +173,7 @@
        this->set_phase_(Phase::IDLE);
        this->advance_phase_();
        break;
-@@ -409,7 +471,7 @@
+@@ -409,7 +477,7 @@
  
  // --- Update op enqueuers -----------------------------------------------------
  
@@ -169,7 +182,7 @@
    // If the controller was put to sleep after the previous update, wake it
    // before touching the display engine. TCON_SLEEP gates off all clocks; a
    // register read (e.g. the LUTAFSR poll in UPDATE_REFRESH) returns a frozen
-@@ -421,23 +483,20 @@
+@@ -421,23 +489,20 @@
      this->enqueue_(OpType::DELAY_MS, 10);  // clocks settle after SYS_RUN
      this->asleep_ = false;
    }
@@ -202,7 +215,7 @@
    if (!this->grayscale_) {
      // Read UP1SR+2: CMD(REG_RD) → WRITE_W(UP1SR+2) → READ_WORD → SET_1BPP
      this->enqueue_(OpType::CMD, TCON_REG_RD);
-@@ -449,8 +508,17 @@
+@@ -449,8 +514,17 @@
    this->enqueue_(OpType::DPY_BUF_ARGS);
  }
  
@@ -221,7 +234,7 @@
      this->enqueue_(OpType::CMD, TCON_SLEEP);
      // Remember that the controller is now asleep so the next update wakes it
      // (see enqueue_update_transfer_) before polling any register.
-@@ -571,64 +639,127 @@
+@@ -571,64 +645,127 @@
    this->prepend_(OpType::CMD, TCON_REG_WR, 0);
  }
  
@@ -315,6 +328,9 @@
 +    if (millis() - start_time >= MAX_TRANSFER_TIME_MS)
 +      break;
 +  }
++
++  return done;
++}
  
 -  // Bytes per source row, and the byte offset of area_x within a row, in the
 -  // framebuffer's native packing. These match the per-row byte count the
@@ -325,9 +341,6 @@
 -      this->grayscale_ ? static_cast<uint16_t>(this->area_w_ >> 1) : static_cast<uint16_t>(this->area_w_ >> 3);
 -  const uint16_t row_x_bytes =
 -      this->grayscale_ ? static_cast<uint16_t>(this->area_x_ >> 1) : static_cast<uint16_t>(this->area_x_ >> 3);
-+  return done;
-+}
-+
 +bool IT8951Display::stream_rows_(const Rect &r, uint32_t start_time, bool preload) {
 +  // Bytes per row and the byte offset of r.x, in the framebuffer's native
 +  // packing: w/2 for 4bpp grayscale, w/8 for the 1bpp-packed monochrome trick.
@@ -385,7 +398,7 @@
  }
  
  void IT8951Display::op_dpy_buf_args_() {
-@@ -656,8 +787,9 @@
+@@ -656,8 +793,9 @@
  
  void IT8951Display::op_check_lut_idle_() {
    ESP_LOGV(TAG, "Checking LUT idle, read_result_=0x%04X", this->read_result_);
@@ -397,7 +410,7 @@
      // LUT still busy — re-enqueue the full read sequence after a short delay.
      this->prepend_(OpType::CHECK_LUT_IDLE, 0, 0);
      this->prepend_(OpType::READ_WORD, 0, 0);
-@@ -743,6 +875,7 @@
+@@ -743,6 +881,7 @@
    if (!full_update && mode == UPDATE_MODE_GC16 && !this->grayscale_)
      mode = UPDATE_MODE_DU;
  
@@ -405,7 +418,7 @@
    this->reset_dirty_region_();
  
    ESP_LOGV(TAG, "Update: %ux%u@%u,%u mode=%u (%s)", width, height, x, y, static_cast<unsigned>(mode),
-@@ -755,6 +888,147 @@
+@@ -755,6 +894,183 @@
    this->x_high_ = 0;
    this->y_low_ = this->height_;
    this->y_high_ = 0;
@@ -537,6 +550,42 @@
 +  return true;
 +}
 +
++void IT8951Display::set_preload_enabled(bool enabled) {
++  this->preload_enabled_ = enabled;
++  if (!enabled) {
++    this->set_preload_source(nullptr, 0, 0);
++    return;
++  }
++#ifdef USE_IMAGE
++  this->select_preload_page_();
++#endif
++}
++
++#ifdef USE_IMAGE
++void IT8951Display::select_preload_page_() {
++  if (this->preload_pages_[0] == nullptr)
++    return;  // no `preload:` in YAML; the lambda calls decide
++  const uint8_t index = this->home_shown_ ? 1 : 0;
++  const image::Image *page = this->preload_pages_[index];
++  if (page == nullptr || this->preload_page_busy_[index] || page->get_data_start() == nullptr) {
++    this->set_preload_source(nullptr, 0, 0);
++    return;
++  }
++  this->set_preload_source(page->get_data_start(), page->get_width_stride(), index + 1);
++}
++
++void IT8951Display::preload_page_changing(uint8_t page) {
++  this->preload_page_busy_[page - 1] = true;
++  this->drop_preload_source(page);
++}
++
++void IT8951Display::preload_page_changed(uint8_t page) {
++  this->preload_page_busy_[page - 1] = false;
++  this->preload_reselect_ = true;
++  this->enable_loop();
++}
++#endif
++
 +void IT8951Display::set_preload_source(const uint8_t *src, size_t stride, uint8_t tag) {
 +  // The preload reproduces what draw_gray4_packed() writes for a full panel.
 +  const bool usable = src != nullptr && this->preload_enabled_ && this->buffer_ != nullptr &&
@@ -553,7 +602,7 @@
  }
  
  void IT8951Display::start_update_(UpdateMode mode) {
-@@ -819,11 +1093,10 @@
+@@ -819,11 +1135,10 @@
      this->spi_setup();
    }
  
@@ -569,7 +618,7 @@
  
    this->set_phase_(Phase::INIT_RESET);
    this->enqueue_init_reset_();
-@@ -835,6 +1108,8 @@
+@@ -835,6 +1150,8 @@
  // --- Coordinate transform ----------------------------------------------------
  
  void IT8951Display::update_effective_transform_() {
@@ -578,7 +627,7 @@
    switch (this->rotation_) {
      case DISPLAY_ROTATION_90_DEGREES:
        this->effective_transform_ = this->transform_ ^ (TRANSFORM_SWAP_XY | TRANSFORM_MIRROR_X);
-@@ -870,6 +1145,8 @@
+@@ -870,6 +1187,8 @@
    this->x_high_ = clamp_at_least(this->x_high_, x + 1);
    this->y_low_ = clamp_at_most(this->y_low_, y);
    this->y_high_ = clamp_at_least(this->y_high_, y + 1);
@@ -587,7 +636,7 @@
    return true;
  }
  
-@@ -924,10 +1201,7 @@
+@@ -924,10 +1243,7 @@
      fill_byte = (packed <= 0x07) ? 0xFF : 0x00;
    }
    memset(this->buffer_, fill_byte, this->buffer_length_);
@@ -599,7 +648,7 @@
  }
  
  void HOT IT8951Display::draw_pixel_at(int x, int y, Color color) {
-@@ -959,6 +1233,70 @@
+@@ -959,6 +1275,79 @@
    }
  }
  
@@ -660,9 +709,18 @@
 +  // A full-panel blit of the preload source leaves the framebuffer equal to
 +  // controller RAM wherever the preload is not stale: only those blocks, and
 +  // whatever is drawn after this, need loading.
-+  if (src == this->preload_src_ && src_stride == this->preload_stride_ && w == this->width_ && h == this->height_) {
-+    std::memcpy(this->drawn_, this->stale_, this->block_count_());
-+    this->adopted_ = true;
++  if (w == this->width_ && h == this->height_) {
++    if (src == this->preload_src_ && src_stride == this->preload_stride_) {
++      std::memcpy(this->drawn_, this->stale_, this->block_count_());
++      this->adopted_ = true;
++    }
++#ifdef USE_IMAGE
++    // After the adoption above, which still needed the old source.
++    if (this->preload_pages_[0] != nullptr) {
++      this->home_shown_ = src == this->preload_pages_[0]->get_data_start();
++      this->select_preload_page_();
++    }
++#endif
 +  }
 +  return true;
 +}
@@ -670,7 +728,7 @@
  void HOT IT8951Display::draw_pixels_internal(int x_start, int y_start, int w, int h, const uint8_t *ptr,
                                               ColorBitness bitness, bool big_endian, int x_offset, int y_offset,
                                               int x_pad) {
-@@ -1015,12 +1353,8 @@
+@@ -1015,12 +1404,8 @@
    const int ny_lo = std::max(0, std::min(y0, y1));
    const int nx_hi = std::min(this->width_ - 1, std::max(x0, x1));
    const int ny_hi = std::min(this->height_ - 1, std::max(y0, y1));
@@ -685,7 +743,7 @@
  }
  
  void IT8951Display::set_mono_pixel_(uint16_t x, uint16_t y, bool value) const {
-@@ -1028,7 +1362,7 @@
+@@ -1028,7 +1413,7 @@
    // controller for the 8bpp-load / 1bpp-display trick (L_ENDIAN). Pixels are
    // grouped in 16s; on the wire the high byte (pixels 8..15) precedes the low
    // byte (pixels 0..7), and the bit index within a byte is the pixel's offset

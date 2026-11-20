@@ -46,20 +46,22 @@ Checked against the 2026.11.0 release. The numbers match the older set, so
 | 03 | Draws 4-bit images, and hands whole images to the fast path |
 | 04 | Lets you use `GRAYSCALE_4BIT` in YAML. Also makes greyscale PNGs load as opaque: stock ESPHome treats them as transparent, which rules out the fast path |
 | 07 | Writes downloaded images (`online_image`) in 4-bit |
-| 08 | IT8951: the fast drawing path, sending four rows per SPI transfer instead of one, and the optional [preload](#preloading-the-next-page) |
+| 08 | IT8951: the fast drawing path, sending four rows per SPI transfer instead of one, and the [preload](#preloading-the-next-page) itself |
 | 09 | IT8951: header for patch 08 |
 | 10 | Faster decoding of downloaded 4-bit images |
 | 11 | Optional (`.optional.patch`, skipped by the loop below): the [light-grey fix](#the-light-grey-fix) |
+| 13 | IT8951: the `preload:` option for the [preload](#preloading-the-next-page) |
 
 Measured on the reTerminal E1003, medians of 10 runs. Each row compares the
-same firmware with and without that one change:
+same firmware with and without that one change, except the page switch row,
+explained [with the preload](#preloading-the-next-page):
 
 | | without | with |
 |---|---|---|
 | Drawing a full-screen 1872x1404 4-bit image (01-04, 08) | 2,464 ms, pixel by pixel | **62 ms** |
 | Sending a full frame to the panel (08), `psram_dma: true`, 20 MHz SPI | 572.5 ms, one row per transfer | **543 ms** |
 | Downloading and decoding a 1872x1404 4-bit PNG (10) | 4.73 s | **4.35 s** |
-| Switching between two full-screen pages, until the new one is on the glass (08, preload) | 1,330 ms | **825-873 ms** |
+| Switching between two full-screen pages, until the new one is on the glass (08, 13; 5 per direction) | 1,330-1,335 ms | **825-873 ms** |
 
 The pixel-by-pixel figure is these patches' own 4-bit pixel path with the fast
 path switched off: stock ESPHome cannot draw a 4-bit image at all.
@@ -112,11 +114,12 @@ of ESPHome, which every update replaces.
 3. Optionally, the [light-grey fix](#the-light-grey-fix), in the same shell:
 
    ```bash
-   patch -p1 -N -r - -d "$SITE" < "$PATCHES/11-it8951-grey-levels.optional.patch"
+   patch -p1 -N -r - --no-backup-if-mismatch -d "$SITE" < "$PATCHES/11-it8951-grey-levels.optional.patch"
    ```
 
-   Without `-b` on purpose: a second backup would overwrite the
-   `it8951.cpp.orig` that step 2 made from the stock file.
+   No backup on purpose, not even the one `patch` makes by itself when a
+   patch applies with an offset: it would overwrite the `it8951.cpp.orig`
+   that step 2 made from the stock file.
 4. Check it worked: `esphome config your-device.yaml` must accept
    `type: GRAYSCALE_4BIT`. If it says the type is unknown, the patches are not
    applied.
@@ -177,10 +180,10 @@ screen, monochrome mode or `invert_colors` on.
 ## Preloading the next page
 
 For configs that switch between full-screen images (dashboard pages, for
-example). Optional: a config that never calls it behaves exactly as without
+example). Optional: a config that does not use it behaves exactly as without
 it, and nothing is allocated.
 
-A page switch normally sends the whole frame to the panel (about 543 ms at
+A page switch normally sends the whole frame to the panel (about 544 ms at
 20 MHz) and then runs the refresh waveform (about 680 ms for GC16). Loading an
 image into the IT8951's memory does not change what is on the glass, so the
 driver can load the page you will probably show next while the panel is
@@ -188,102 +191,111 @@ idle. When you then draw that page, it only sends what differs from the
 preloaded copy: whatever you draw on top of it, plus any area another update
 overwrote in the meantime.
 
-Measured on the reTerminal E1003, two 1872x1404 pages, medians of 10 switches:
+Measured on the reTerminal E1003, two 1872x1404 pages, 10 switches back and
+forth per row, so medians of 5 per direction:
 
 | | to page 1 | to page 2 |
 |---|---|---|
 | Without the preload | 1,330 ms | 1,335 ms |
 | With the preload | **825 ms** | **873 ms** |
-| Sent to the panel at the switch | 543 ms to 45 ms | 543 ms to 84 ms |
+| Time spent sending to the panel at the switch | 544 ms to 46 ms | 544 ms to 84 ms |
 
-What is left is drawing the framebuffer (~65 ms), the overlays and the GC16
+The row without the preload comes from the first build that had it, with
+the preload switched off; the row with it from the final build. Nothing
+since changed the path the preload-off run takes: a full repaint with the
+preload off still sends in 543-544 ms on the final build. What is left of a
+switch is drawing the framebuffer (~65 ms), the overlays and the GC16
 waveform itself, which the patches cannot shorten.
 
 ### How to use it
 
-Three calls on the display, all from lambdas:
-
-- `id(epd).set_preload_source(img->get_data_start(), img->get_width_stride(), tag)`
-  for the image you expect to draw next. `tag` is any number you choose, to
-  name the source later. Setting the same source again does nothing, so you
-  can call it freely.
-- `id(epd).drop_preload_source(tag)` **before** that image's content changes.
-  An `online_image` decodes into the same buffer, at the same address, so the
-  driver cannot notice the change by itself.
-- `id(epd).set_preload_enabled(false)` turns it off at runtime (and `true`
-  back on; set the source again afterwards).
-
-Two pages from `online_image`, switched with a global:
+Name the page that is usually on screen and the one most likely to come
+next. That is all the configuration there is (patch 13):
 
 ```yaml
-globals:
-  - id: current_page
-    type: int
-    initial_value: '1'
-
-script:
-  # Hands the page that is not on screen to the driver. With more than two
-  # pages, pick the one most likely to be shown next.
-  - id: preload_hidden_page
-    then:
-      - lambda: |-
-          const int hidden = id(current_page) == 1 ? 2 : 1;
-          auto *img = hidden == 1 ? id(page_1) : id(page_2);
-          if (img->get_data_start() != nullptr && !img->is_decoding())
-            id(epd).set_preload_source(img->get_data_start(), img->get_width_stride(), hidden);
-          else
-            id(epd).set_preload_source(nullptr, 0, 0);
-
-image:
-  - platform: online_image
-    id: page_1
-    url: http://example.local/1.png
-    format: PNG
-    type: GRAYSCALE_4BIT
-    on_download_started:
-      - lambda: 'id(epd).drop_preload_source(1);'
-    on_download_finished:
-      - script.execute: preload_hidden_page
-
-  - platform: online_image
-    id: page_2
-    url: http://example.local/2.png
-    format: PNG
-    type: GRAYSCALE_4BIT
-    on_download_started:
-      - lambda: 'id(epd).drop_preload_source(2);'
-    on_download_finished:
-      - script.execute: preload_hidden_page
-
 display:
   - platform: it8951
     id: epd
     psram_dma: true
     # ...
+    preload:
+      home: page_1   # loaded while any other page is on screen
+      next: page_2   # loaded while page_1 is on screen
     lambda: |-
-      auto *page = id(current_page) == 1 ? id(page_1) : id(page_2);
-      it.image(0, 0, page);
+      it.image(0, 0, id(current_page) == 1 ? id(page_1) : id(page_2));
       // Anything drawn here, after the page, is sent at the switch.
-      // After the page, not before: this draw still uses the old preload.
-      id(preload_hidden_page).execute();
 ```
 
-To switch, set `current_page` and call `component.update: epd`.
+The driver works out which page is up from the last full-screen image it
+drew, and loads the other one. For an `online_image` it also follows the
+downloads by itself: a page is never preloaded while it decodes, and is
+loaded again once the download is done. `next` is optional. With more than
+two pages, any page other than `home` counts as away, so `home` is what gets
+preloaded then.
+
+The build stops with an error if a `preload:` image is not an opaque
+`GRAYSCALE_4BIT` image of exactly the panel's size, or if the display has
+`grayscale: false` or its axes swapped. The size is checked when it is known
+at build time; an `online_image` without `resize:` only has one once it
+arrives, and a wrong size then simply means the preload is never used.
+
+Optionally, a switch in Home Assistant to turn it off and on, for comparing
+or if your panel turns out not to keep the preloaded page:
+
+```yaml
+switch:
+  - platform: template
+    name: "Preload next page"
+    restore_mode: RESTORE_DEFAULT_ON
+    optimistic: true
+    turn_on_action:
+      - lambda: 'id(epd).set_preload_enabled(true);'
+    turn_off_action:
+      - lambda: 'id(epd).set_preload_enabled(false);'
+```
+
+`RESTORE_DEFAULT_ON` brings back the last state after a reboot or a flash,
+so once you turn it off it stays off until you turn it on again.
+
+### For other rules: three lambda calls
+
+Without `preload:`, a config can drive the preload itself:
+
+- `id(epd).set_preload_source(img->get_data_start(), img->get_width_stride(), tag)`
+  for the image you expect to draw next. `tag` is any number you choose, to
+  name the source later. Setting the same source again does nothing, so you
+  can call it freely. Call it after drawing the current page, not before:
+  that draw still uses the old preload.
+- `id(epd).drop_preload_source(tag)` **before** that image's content changes,
+  for example from its `on_download_started`: an `online_image` decodes into
+  the same buffer, at the same address, so the driver cannot notice the
+  change by itself. Set the source again after the download.
+- `id(epd).set_preload_enabled(false)` turns it off at runtime.
+
+`preload:` uses tags 1 (`home`) and 2 (`next`) itself, so use one way or the
+other, not both.
 
 ### Rules and caveats
 
 - **The page must be drawn whole, first.** The preload is only used by an
-  `it.image(0, 0, img)` that covers the entire panel, with the same image you
-  gave `set_preload_source()`. The image needs the fast drawing path: opaque,
-  `GRAYSCALE_4BIT`, exactly the panel's size, greyscale mode, `invert_colors`
-  off, not rotated by 90 or 270 degrees. Anything else is ignored, and the
-  update simply sends everything as before.
-- **Drop before the content changes, set again after.** Forgetting the drop
-  is the one mistake that shows wrong pixels: the switch would send only the
-  overlays on top of the old copy of the page. Also drop before
-  `online_image.release`.
+  `it.image(0, 0, img)` that covers the entire panel, with the preloaded
+  image. The image needs the fast drawing path: opaque, `GRAYSCALE_4BIT`,
+  exactly the panel's size, greyscale mode, `invert_colors` off, not rotated
+  by 90 or 270 degrees. Anything else is ignored, and the update simply sends
+  everything as before.
+- **Writing into a page image yourself.** `preload:` follows `online_image`
+  downloads, including your own `on_download_finished` handlers, which run
+  before it loads the page again. Anything else that changes a page image's
+  pixels, or `online_image.release`, it does not see: call
+  `id(epd).preload_page_changing(1)` before (1 for `home`, 2 for `next`), and
+  `id(epd).preload_page_changed(1)` once the image is whole again. These two
+  exist only when the config has an `image:` (ESPHome then defines
+  `USE_IMAGE`; `online_image` counts), which any preload config does. With
+  the lambda calls, drop the source instead. A missed change is the one mistake
+  that shows wrong pixels: the switch would send only the overlays on top of
+  the old copy of the page.
 - **One preloaded page.** The controller holds the page on screen and one
-  more. With three or more pages, choose the likeliest next one.
+  more.
 - **It relies on the controller keeping what was loaded until the switch**,
   including while it sleeps between updates (`sleep_when_done: true`). That
   holds on the reTerminal E1003. On other IT8951 panels, check a few switches
@@ -293,9 +305,8 @@ To switch, set `current_page` and call `component.update: epd`.
   waveform to finish (~0.7 s), then loads the next page (~570 ms of SPI, in
   20 ms slices). Any update you request meanwhile goes first. The main loop
   runs at full speed during that time, which matters if you use light sleep.
-- **Memory, from the first `set_preload_source()` on:** about 10 KB of PSRAM
-  (two maps of one byte per 32x16 block) and 4 KB of internal RAM for a
-  staging buffer.
+- **Memory, from the first preload on:** about 10 KB of PSRAM (two maps of
+  one byte per 32x16 block) and 4 KB of internal RAM for a staging buffer.
 - **Partial updates get a little faster too** once the staging buffer exists:
   narrow areas go out as one SPI transfer per 4 KB instead of one per row.
 - **The `Update took` log line gets shorter** (VERBOSE): when a preload
@@ -305,8 +316,8 @@ To switch, set `current_page` and call `component.update: epd`.
   sends only a few. Both it and the `Preload rows 0-1404 done` line need
   `logger: level: VERBOSE`; a per-tag `logs:` entry cannot go above the
   global level.
-- Monochrome mode (`grayscale: false`) does not support the preload; the
-  calls are accepted and do nothing.
+- Monochrome mode (`grayscale: false`) does not support the preload: the
+  build refuses `preload:`, and the lambda calls do nothing.
 
 ## Tips
 
