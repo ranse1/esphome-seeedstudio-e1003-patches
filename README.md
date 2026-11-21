@@ -251,12 +251,18 @@ Instead of `preload:` (which uses tags 1 and 2 itself; use one or the other):
   everything as before.
 - **Writing into a page image yourself.** `preload:` sees `online_image`
   downloads, including your `on_download_finished` handlers (they run before
-  the reload), but not other pixel writes or `online_image.release`. Wrap
-  those in `id(epd).preload_page_changing(n)` and
-  `id(epd).preload_page_changed(n)` (1 = `home`, 2 = `next`; they exist when
-  `USE_IMAGE` is defined, which any preload config has). With the lambda
-  calls, drop the source instead. A missed change is the one way to show
-  wrong pixels: overlays sent onto the stale page.
+  the reload), but not other pixel writes. Wrap those in
+  `id(epd).preload_page_changing(n)` and `id(epd).preload_page_changed(n)`
+  (1 = `home`, 2 = `next`; they exist when `USE_IMAGE` is defined, which any
+  preload config has). With the lambda calls, drop the source instead. A
+  missed change is the one way to show wrong pixels: overlays sent onto the
+  stale page.
+- **Releasing a page image.** With `preload:`, the driver notices on its next
+  loop pass that a page's buffer moved or vanished (`online_image.release`, an
+  aborted decode) and stops using it, so a release outside a download needs
+  no wrapping. A release DURING a download still leaves that page marked busy
+  until its next successful download. Lambda-set sources are not checked:
+  drop them before releasing.
 - **One preloaded page**: the controller holds the visible page and one more.
 - **The controller must keep the preloaded page**, also while asleep
   (`sleep_when_done: true`). True on the E1003. On other panels, check a few

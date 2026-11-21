@@ -122,7 +122,17 @@
    void enqueue_update_transfer_();
    void enqueue_update_refresh_();
    void enqueue_update_sleep_();
-@@ -339,6 +392,40 @@
+@@ -282,6 +335,9 @@
+   Phase phase_{Phase::IDLE};
+   uint32_t delay_until_{0};
+   uint32_t phase_started_at_{0};
++  // When HW_RDY was first seen low for the op at the queue head.
++  uint32_t busy_since_{0};
++  bool busy_waiting_{false};
+   // Requests a continuous (non-throttled) main loop while streaming image data
+   // so 20ms transfer slices aren't separated by the ~16ms default loop interval.
+   HighFrequencyLoopRequester high_freq_;
+@@ -339,6 +395,40 @@
    // Dirty region (pixel coordinates of bounding box of changes since last update)
    uint16_t x_low_{0}, y_low_{0}, x_high_{0}, y_high_{0};
  

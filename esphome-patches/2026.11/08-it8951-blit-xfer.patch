@@ -1,6 +1,14 @@
 --- a/esphome/components/it8951/it8951.cpp
 +++ b/esphome/components/it8951/it8951.cpp
-@@ -12,9 +12,54 @@
+@@ -8,13 +8,62 @@
+ #include "esphome/core/helpers.h"
+ #include "esphome/core/log.h"
+ 
++#ifdef USE_ESP32
++#include <esp_heap_caps.h>
++#endif
++
+ namespace esphome::it8951 {
  
  ESPHOME_LOG_TAG(TAG, "it8951");
  
@@ -56,7 +64,7 @@
  
  // --- Loop / scheduling -------------------------------------------------------
  
-@@ -38,6 +83,12 @@
+@@ -38,6 +87,20 @@
  }
  
  void IT8951Display::loop() {
@@ -65,11 +73,19 @@
 +    this->preload_reselect_ = false;
 +    this->select_preload_page_();
 +  }
++  // A page freed without a new download (online_image.release, an aborted
++  // decode) fires no hook, and streaming the freed buffer would load garbage
++  // that a later blit at a reused address could even adopt as current.
++  if (this->preload_tag_ >= 1 && this->preload_tag_ <= 2 && this->preload_pages_[0] != nullptr) {
++    const image::Image *page = this->preload_pages_[this->preload_tag_ - 1];
++    if (page == nullptr || page->get_data_start() != this->preload_src_)
++      this->select_preload_page_();
++  }
 +#endif
    const uint32_t now = millis();
    if (static_cast<int32_t>(now - this->delay_until_) < 0)
      return;
-@@ -45,10 +96,7 @@
+@@ -45,10 +108,7 @@
    // Nothing queued — either the current phase has more work to enqueue, or
    // we're done.
    if (this->queue_.empty()) {
@@ -81,7 +97,37 @@
      this->advance_phase_();
      if (this->queue_.empty())
        return;
-@@ -105,26 +153,12 @@
+@@ -61,9 +121,20 @@
+   const bool needs_hardware_ready = queued_op.type != OpType::GPIO_RESET_LOW &&
+                                     queued_op.type != OpType::GPIO_RESET_HIGH && queued_op.type != OpType::DELAY_MS;
+   if (needs_hardware_ready && this->is_busy_()) {
++    // Timed from when HW_RDY went low, or from the phase start if that is
++    // later: 08h's phases see short busy spells mid-phase (between rects, and
++    // across the ~1.1 s preload), and a loop starved past the timeout used to
++    // reset a controller that had only just gone busy.
++    if (!this->busy_waiting_) {
++      this->busy_waiting_ = true;
++      this->busy_since_ = now;
++    }
++    const uint32_t since = static_cast<int32_t>(this->busy_since_ - this->phase_started_at_) > 0
++                               ? this->busy_since_
++                               : this->phase_started_at_;
+     // Signed elapsed: any pending DELAY_MS or scheduled work in the near
+     // future shows up as <= 0 elapsed and won't trigger a false timeout.
+-    const int32_t elapsed = static_cast<int32_t>(now - this->phase_started_at_);
++    const int32_t elapsed = static_cast<int32_t>(now - since);
+     ESP_LOGV(TAG, "HW_RDY is LOW (busy) in phase %u, elapsed=%" PRId32 "ms", static_cast<unsigned>(this->phase_),
+              elapsed);
+     if (elapsed > static_cast<int32_t>(BUSY_TIMEOUT_MS)) {
+@@ -73,6 +144,7 @@
+     }
+     return;
+   }
++  this->busy_waiting_ = false;
+ 
+   this->queue_.pop_front();
+   this->process_op_(queued_op);
+@@ -105,26 +177,12 @@
      case OpType::XFER_LISAR:
        this->op_xfer_lisar_();
        break;
@@ -114,7 +160,7 @@
        break;
      case OpType::DPY_BUF_CMD:
        // Some panel firmwares (notably Seeed reTerminal E1003) silently drop
-@@ -179,6 +213,8 @@
+@@ -179,6 +237,8 @@
          this->update_started_at_ = millis();
          this->set_phase_(Phase::UPDATE_PREPARE);
          this->advance_phase_();
@@ -123,7 +169,7 @@
        } else {
          this->disable_loop();
        }
-@@ -270,6 +306,7 @@
+@@ -270,6 +330,7 @@
      }
  
      case Phase::UPDATE_TRANSFER:
@@ -131,7 +177,7 @@
        this->set_phase_(Phase::UPDATE_REFRESH);
        this->enqueue_update_refresh_();
        break;
-@@ -288,8 +325,39 @@
+@@ -288,8 +349,39 @@
        break;
  
      case Phase::UPDATE_SLEEP:
@@ -173,7 +219,7 @@
        this->set_phase_(Phase::IDLE);
        this->advance_phase_();
        break;
-@@ -409,7 +477,7 @@
+@@ -409,7 +501,7 @@
  
  // --- Update op enqueuers -----------------------------------------------------
  
@@ -182,7 +228,7 @@
    // If the controller was put to sleep after the previous update, wake it
    // before touching the display engine. TCON_SLEEP gates off all clocks; a
    // register read (e.g. the LUTAFSR poll in UPDATE_REFRESH) returns a frozen
-@@ -421,23 +489,20 @@
+@@ -421,23 +513,20 @@
      this->enqueue_(OpType::DELAY_MS, 10);  // clocks settle after SYS_RUN
      this->asleep_ = false;
    }
@@ -215,7 +261,7 @@
    if (!this->grayscale_) {
      // Read UP1SR+2: CMD(REG_RD) → WRITE_W(UP1SR+2) → READ_WORD → SET_1BPP
      this->enqueue_(OpType::CMD, TCON_REG_RD);
-@@ -449,8 +514,17 @@
+@@ -449,8 +538,17 @@
    this->enqueue_(OpType::DPY_BUF_ARGS);
  }
  
@@ -234,7 +280,7 @@
      this->enqueue_(OpType::CMD, TCON_SLEEP);
      // Remember that the controller is now asleep so the next update wakes it
      // (see enqueue_update_transfer_) before polling any register.
-@@ -571,64 +645,127 @@
+@@ -571,64 +669,127 @@
    this->prepend_(OpType::CMD, TCON_REG_WR, 0);
  }
  
@@ -328,9 +374,6 @@
 +    if (millis() - start_time >= MAX_TRANSFER_TIME_MS)
 +      break;
 +  }
-+
-+  return done;
-+}
  
 -  // Bytes per source row, and the byte offset of area_x within a row, in the
 -  // framebuffer's native packing. These match the per-row byte count the
@@ -341,6 +384,10 @@
 -      this->grayscale_ ? static_cast<uint16_t>(this->area_w_ >> 1) : static_cast<uint16_t>(this->area_w_ >> 3);
 -  const uint16_t row_x_bytes =
 -      this->grayscale_ ? static_cast<uint16_t>(this->area_x_ >> 1) : static_cast<uint16_t>(this->area_x_ >> 3);
++  return done;
++}
+ 
+-  // Single CS write transaction — HW_RDY was confirmed high by the loop gate.
 +bool IT8951Display::stream_rows_(const Rect &r, uint32_t start_time, bool preload) {
 +  // Bytes per row and the byte offset of r.x, in the framebuffer's native
 +  // packing: w/2 for 4bpp grayscale, w/8 for the 1bpp-packed monochrome trick.
@@ -361,8 +408,7 @@
 +  const bool direct = contiguous || this->stage_ == nullptr;
 +  const uint16_t rows_per_write =
 +      contiguous || this->stage_ != nullptr ? std::max<uint16_t>(1, XFER_BATCH_BYTES / bytes_per_row) : 1;
- 
--  // Single CS write transaction — HW_RDY was confirmed high by the loop gate.
++
 +  // Single CS write transaction; HW_RDY was confirmed high just before.
    this->enable();
    this->write_byte16(PACKET_TYPE_WRITE);
@@ -398,7 +444,7 @@
  }
  
  void IT8951Display::op_dpy_buf_args_() {
-@@ -656,8 +793,9 @@
+@@ -656,8 +817,9 @@
  
  void IT8951Display::op_check_lut_idle_() {
    ESP_LOGV(TAG, "Checking LUT idle, read_result_=0x%04X", this->read_result_);
@@ -410,7 +456,7 @@
      // LUT still busy — re-enqueue the full read sequence after a short delay.
      this->prepend_(OpType::CHECK_LUT_IDLE, 0, 0);
      this->prepend_(OpType::READ_WORD, 0, 0);
-@@ -743,6 +881,7 @@
+@@ -743,6 +905,7 @@
    if (!full_update && mode == UPDATE_MODE_GC16 && !this->grayscale_)
      mode = UPDATE_MODE_DU;
  
@@ -418,7 +464,7 @@
    this->reset_dirty_region_();
  
    ESP_LOGV(TAG, "Update: %ux%u@%u,%u mode=%u (%s)", width, height, x, y, static_cast<unsigned>(mode),
-@@ -755,6 +894,183 @@
+@@ -755,6 +918,196 @@
    this->x_high_ = 0;
    this->y_low_ = this->height_;
    this->y_high_ = 0;
@@ -525,7 +571,8 @@
 +}
 +
 +// On first use only, so a display that never preloads keeps its memory and
-+// loads every update's whole area one row at a time, as before.
++// transfers every update as before 08h: full-width areas four rows per write
++// (08f), narrower ones a row at a time.
 +bool IT8951Display::allocate_preload_() {
 +  if (this->stage_ != nullptr)
 +    return true;
@@ -533,15 +580,27 @@
 +  this->block_rows_ = static_cast<uint16_t>((this->height_ + BLOCK_H - 1) / BLOCK_H);
 +  RAMAllocator<uint8_t> allocator{};
 +  uint8_t *maps = allocator.allocate(2 * this->block_count_());
-+  // Internal RAM: the CPU fills it and the DMA reads it with no PSRAM round trip.
++  // Internal RAM: the CPU fills it and the DMA reads it with no PSRAM round
++  // trip. DMA-capable too: the S3's internal heap includes RTC fast memory,
++  // which SPI DMA cannot read, and IDF would then bounce every batch through
++  // a buffer of its own without a word in the log.
++#ifdef USE_ESP32
++  auto *stage = static_cast<uint8_t *>(heap_caps_malloc(XFER_BATCH_BYTES, MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
++#else
 +  RAMAllocator<uint8_t> internal(RAMAllocator<uint8_t>::ALLOC_INTERNAL);
 +  uint8_t *stage = internal.allocate(XFER_BATCH_BYTES);
++#endif
 +  if (maps == nullptr || stage == nullptr) {
 +    ESP_LOGW(TAG, "No memory for the preload buffers; preload off");
 +    if (maps != nullptr)
 +      allocator.deallocate(maps, 2 * this->block_count_());
-+    if (stage != nullptr)
++    if (stage != nullptr) {
++#ifdef USE_ESP32
++      heap_caps_free(stage);
++#else
 +      internal.deallocate(stage, XFER_BATCH_BYTES);
++#endif
++    }
 +    return false;
 +  }
 +  this->drawn_ = maps;
@@ -602,7 +661,7 @@
  }
  
  void IT8951Display::start_update_(UpdateMode mode) {
-@@ -819,11 +1135,10 @@
+@@ -819,11 +1172,10 @@
      this->spi_setup();
    }
  
@@ -618,7 +677,7 @@
  
    this->set_phase_(Phase::INIT_RESET);
    this->enqueue_init_reset_();
-@@ -835,6 +1150,8 @@
+@@ -835,6 +1187,8 @@
  // --- Coordinate transform ----------------------------------------------------
  
  void IT8951Display::update_effective_transform_() {
@@ -627,7 +686,7 @@
    switch (this->rotation_) {
      case DISPLAY_ROTATION_90_DEGREES:
        this->effective_transform_ = this->transform_ ^ (TRANSFORM_SWAP_XY | TRANSFORM_MIRROR_X);
-@@ -870,6 +1187,8 @@
+@@ -870,6 +1224,8 @@
    this->x_high_ = clamp_at_least(this->x_high_, x + 1);
    this->y_low_ = clamp_at_most(this->y_low_, y);
    this->y_high_ = clamp_at_least(this->y_high_, y + 1);
@@ -636,7 +695,7 @@
    return true;
  }
  
-@@ -924,10 +1243,7 @@
+@@ -924,10 +1280,7 @@
      fill_byte = (packed <= 0x07) ? 0xFF : 0x00;
    }
    memset(this->buffer_, fill_byte, this->buffer_length_);
@@ -648,7 +707,7 @@
  }
  
  void HOT IT8951Display::draw_pixel_at(int x, int y, Color color) {
-@@ -959,6 +1275,79 @@
+@@ -959,6 +1312,79 @@
    }
  }
  
@@ -728,7 +787,7 @@
  void HOT IT8951Display::draw_pixels_internal(int x_start, int y_start, int w, int h, const uint8_t *ptr,
                                               ColorBitness bitness, bool big_endian, int x_offset, int y_offset,
                                               int x_pad) {
-@@ -1015,12 +1404,8 @@
+@@ -1015,12 +1441,8 @@
    const int ny_lo = std::max(0, std::min(y0, y1));
    const int nx_hi = std::min(this->width_ - 1, std::max(x0, x1));
    const int ny_hi = std::min(this->height_ - 1, std::max(y0, y1));
@@ -743,7 +802,7 @@
  }
  
  void IT8951Display::set_mono_pixel_(uint16_t x, uint16_t y, bool value) const {
-@@ -1028,7 +1413,7 @@
+@@ -1028,7 +1450,7 @@
    // controller for the 8bpp-load / 1bpp-display trick (L_ENDIAN). Pixels are
    // grouped in 16s; on the wire the high byte (pixels 8..15) precedes the low
    // byte (pixels 0..7), and the bit index within a byte is the pixel's offset
